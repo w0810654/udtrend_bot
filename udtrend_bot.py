@@ -1,0 +1,3308 @@
+#!/usr/bin/env python3
+"""
+Udtrend LLC bot (udtrend.com)
+"""
+
+import asyncio
+import random
+import string
+import logging
+import os
+from datetime import datetime, timedelta
+from io import BytesIO
+
+from playwright.async_api import async_playwright
+from telegram import Bot, Update, InputMediaPhoto
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    ChatMemberHandler,
+    filters,
+    ContextTypes,
+)
+from telegram.error import TelegramError
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────
+BOT_TOKEN             = os.environ.get("UDTREND_BOT_TOKEN", "8559354071:AAEkJNAFs1eI1BPboIBUkabYf_W8VElGR8g")
+POST_INTERVAL_MINUTES = int(os.environ.get("POST_INTERVAL_MINUTES", "30"))
+# ─────────────────────────────────────────────────────────────────
+
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+known_channels: set[int] = set()
+last_message_ids: dict[int, list[int]] = {}  # Maps channel_id → list of last message_ids
+
+# ─── Name pools (grouped by ethnicity so first + last names stay consistent) ───
+NAME_GROUPS = {
+    "igbo": {
+        "first": [
+            "CHUKWUEMEKA","ADAEZE","TOCHUKWU","AMAKA","CHIDINMA","EMEKA","IFEANYI",
+            "KINGSLEY","NGOZI","OBIORA","UCHE","CHIDI","IFEOMA","KELECHI","CHIAMAKA",
+            "OBINNA","EKENE","CHINYERE","CHINAGOROM","ONYEKA","NNAMDI","CHIKA",
+        ],
+        "last": [
+            "OKAFOR","NWOSU","EZE","NWACHUKWU","OKONKWO","CHUKWU","DIKE","MADUKA",
+            "NNAMDI","CHUKWUDI","ODINAKA","NNAETOO","KANU","OBI",
+        ],
+    },
+    "yoruba": {
+        "first": [
+            "OLUWASEUN","BABATUNDE","FUNMI","GBENGA","JUMOKE","SOLA","TEMITOPE",
+            "WUNMI","YETUNDE","ADEWALE","BUKOLA","DAMILOLA","FOLAKE","TUNDE",
+            "ABIODUN","OLAMIDE","TAIWO","KEHINDE",
+        ],
+        "last": [
+            "ADEYEMI","BALOGUN","LAWAL","QUADRI","RAJI","FADAHUNSI","IDOWU","LEKE",
+            "ABIODUN","BABATOLA","DARAMOLA","ADELEKE","OGUNDIMU","SHITTU",
+        ],
+    },
+    "hausa": {
+        "first": [
+            "HALIMA","ZAINAB","HAUWA","IBRAHIM","USMAN","MUSA","ALIYU","AMINU",
+            "FATIMA","ABUBAKAR","SADIQ","BASHIR","MARYAM","YUSUF",
+        ],
+        "last": [
+            "IBRAHIM","MUSA","USMAN","GARBA","HARUNA","BELLO","SANI","ABUBAKAR",
+            "ALIYU","DANJUMA","LAWAL","MOHAMMED",
+        ],
+    },
+    "general": {
+        # Christian / Niger-Delta / pan-Nigerian names that pair broadly
+        "first": [
+            "MICHAEL","PATIENCE","QUEEN","RAPHAEL","DAVID","BLESSING","DIVINE",
+            "ELISHA","FLORENCE","GRACE","HENRY","JOSEPH","GODWIN","PAUL","JOY",
+            "VICTOR","LILIAN","DAMIETE",
+        ],
+        "last": [
+            "JOHNSON","PETERS","SMITH","VINCENT","WILLIAMS","JAMES","PIUS",
+            "AKPAN","EFFIONG","IMEH","EKWERRE","IDA-EREFA","BRIGGS","OSEI","EBOIGBE",
+        ],
+    },
+}
+
+def random_name() -> str:
+    group = random.choice(list(NAME_GROUPS.values()))
+    first = random.choice(group["first"]).upper()
+    last = random.choice(group["last"]).upper()
+    return f"{first} {last}"
+
+def random_amount() -> int:
+    pool = [
+        random.randint(200_000,   999_999),
+        random.randint(1_000_000, 2_999_999),
+        random.randint(3_000_000, 5_000_000),
+    ]
+    return round(random.choice(pool) / 1_000) * 1_000
+
+def fmt_ngn(amount: int) -> str:
+    return f"{amount:,.2f}"
+
+def fmt_ngn_full(amount: int) -> str:
+    return f"{amount:,.2f} NGN"
+
+def fmt_caption(amount: int) -> str:
+    return f"{amount:,}"
+
+def rand_ref_S() -> str:
+    return "S" + "".join(random.choices(string.digits, k=8))
+
+def rand_ref_hex(n=42) -> str:
+    return "".join(random.choices("0123456789abcdef", k=n))
+
+def rand_digits(n) -> str:
+    return "".join(random.choices(string.digits, k=n))
+
+def rand_session_id() -> str:
+    return "000017" + rand_digits(24)
+
+def transaction_time(post_time: datetime) -> datetime:
+    return post_time - timedelta(minutes=random.randint(30, 60))
+
+def fmt_date_dmy(dt: datetime) -> str:
+    return dt.strftime("%d/%m/%Y")
+
+def fmt_date_long(dt: datetime) -> str:
+    days   = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    h = dt.hour % 12 or 12
+    ampm = "am" if dt.hour < 12 else "pm"
+    return f"{days[dt.weekday()]}, {months[dt.month-1]} {dt.day}, {dt.year}, {h}:{dt.strftime('%M')} {ampm}"
+
+def fmt_date_short(dt: datetime) -> str:
+    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    h = dt.hour % 12 or 12
+    ampm = "PM" if dt.hour >= 12 else "AM"
+    return f"{months[dt.month-1]} {dt.day}, {dt.year} {h}:{dt.strftime('%M')} {ampm}"
+
+def fmt_date_uba(dt: datetime) -> str:
+    days   = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    return f"{days[dt.weekday()]} {months[dt.month-1]} {dt.day:02d} {dt.year}"
+
+def fmt_time_hms(dt: datetime) -> str:
+    return dt.strftime("%H:%M:%S")
+
+def fmt_time_hm(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
+def fmt_gtbank_dt(dt: datetime) -> str:
+    return f"{dt.day} {['January','February','March','April','May','June','July','August','September','October','November','December'][dt.month-1]} {dt.year} at {fmt_time_hm(dt)}"
+
+def rand_at_ref() -> str:
+    chars = string.ascii_letters + string.digits
+    return "AT" + rand_digits(2) + "_TRF2MPT" + "".join(random.choices(chars, k=8))
+
+def number_to_words(n: int) -> str:
+    if n == 0: return "Zero"
+    ones = ["","One","Two","Three","Four","Five","Six","Seven","Eight","Nine",
+            "Ten","Eleven","Twelve","Thirteen","Fourteen","Fifteen","Sixteen",
+            "Seventeen","Eighteen","Nineteen"]
+    tens_w = ["","","Twenty","Thirty","Forty","Fifty","Sixty","Seventy","Eighty","Ninety"]
+    def below1000(x):
+        if x == 0: return ""
+        elif x < 20: return ones[x]
+        elif x < 100: return tens_w[x//10] + (" " + ones[x%10] if x%10 else "")
+        else: return ones[x//100] + " Hundred" + (" " + below1000(x%100) if x%100 else "")
+    parts, labels, i = [], ["","Thousand","Million","Billion"], 0
+    while n > 0:
+        if n % 1000: parts.append(below1000(n%1000) + (" " + labels[i] if labels[i] else ""))
+        n //= 1000; i += 1
+    return " ".join(reversed(parts))
+
+def mask_account(acc: str) -> str:
+    """Mask middle digits: 0812345678 → 081****678"""
+    acc = str(acc).strip()
+    if len(acc) <= 6:
+        return acc[:2] + "****"
+    return acc[:3] + "****" + acc[-3:]
+
+
+def mask_account_sup(acc: str) -> str:
+    """Mask middle digits with superscript asterisks for Assets MFB style:
+       0812345678 → 081<sup class='asterisk'>*</sup>...678"""
+    acc = str(acc).strip()
+    stars = '<sup class="asterisk">*</sup>' * 3
+    if len(acc) <= 6:
+        return acc[:2] + stars
+    return acc[:4] + stars + acc[-3:]
+
+
+# ══════════════════════════════════════════════════════     ═════════
+# SHARED CONSTANTS
+# ════════════════════════════════════════════════════════════════
+TAILWIND   = '<script src="https://cdn.tailwindcss.com"></script>'
+INTER_FONT = '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">'
+
+
+SENDER_BANK = "Moniepoint MFB"
+
+
+OPAY_BANKS = {
+    "Wema Bank PLC": "https://s3-symbol-logo.tradingview.com/wema-bank-plc--600.png",
+    "PAYSTACK-TITAN": "https://i.ibb.co/fLkMFXr/paystack-logo-modified.png",
+}
+
+
+# ════════════════════════════════════════════════════════════════
+# TEMPLATE BUILDERS
+# ════════════════════════════════════════════════════════════════
+
+# ── UBA Classic (UBA 1) ───────────────────────────────────────────────────────
+def tpl_uba1(receiver: str, amount: int, tx: datetime) -> str:
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Transaction Details</title>
+{TAILWIND}
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{{font-size:14px}}
+body{{font-family:'Inter',sans-serif;background:white;margin:0;padding:0}}
+.border-thin{{border-bottom-width:1px!important;border-color:#000!important}}
+.section-title{{font-size:16px;font-weight:600}}
+</style></head>
+<body class="bg-white">
+<div style="width:100%;line-height:0">
+  <img src="https://i.ibb.co/MkMxhN90/photo-2025-10-05-12-11-43.jpg"
+       style="width:100%;height:auto;display:block;max-width:100%"
+       onerror="this.style.display='none'">
+</div>
+<div class="max-w-4xl p-4" style="position:relative">
+  <img src="https://i.ibb.co/1f3RKwzD/trba.png"
+       alt=""
+       style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:85%;max-width:520px;height:auto;opacity:0.15;z-index:0;pointer-events:none"
+       onerror="this.style.display='none'">
+  <div style="position:relative;z-index:1">
+    <h1 class="section-title mb-2">Transaction Details:-</h1>
+    <div class="border-thin mb-4"></div>
+    <div class="space-y-3 mb-6">
+      <div><span class="font-semibold">Date:</span> {fmt_date_uba(tx)}</div>
+      <div><span class="font-semibold">Time:</span> {fmt_time_hms(tx)}</div>
+      <div><span class="font-semibold">Reference:</span> {rand_ref_S()}</div>
+      <div><span class="font-semibold">Amount:</span> {fmt_ngn_full(amount)}</div>
+      <div><span class="font-semibold">Status:</span> SUCCESSFUL</div>
+      <div><span class="font-semibold">Type:</span> Credit</div>
+    </div>
+    <h2 class="section-title mb-2">Accounts Details:-</h2>
+    <div class="border-thin mb-4"></div>
+    <div><span class="font-semibold">Narration:</span> TNF-Udtrend LLC/Transfer/ To {receiver}</div>
+  </div>
+</div>
+</body></html>"""
+
+
+# ── UBA Modern (UBA 2) ────────────────────────────────────────────────────────
+def tpl_uba2(receiver: str, amount: int, tx: datetime) -> str:
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Transaction Details</title>
+{TAILWIND}
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{{font-size:14px}}html,body{{height:100%;margin:0;padding:0}}
+body{{font-family:'Inter',sans-serif}}
+.border-thin{{border-bottom-width:1px!important;border-color:#000!important}}
+.section-title{{font-size:16px;font-weight:600}}
+</style></head>
+<body class="min-h-screen bg-gradient-to-b from-[#fbfbfb] to-[#f8f8fa]">
+<div style="width:100%;line-height:0">
+  <img src="https://i.ibb.co/n8P6m7J2/topp.jpg"
+       style="width:100%;height:auto;display:block;max-width:100%"
+       onerror="this.style.display='none'">
+</div>
+<div class="max-w-4xl p-4 mx-auto">
+  <h1 class="section-title mb-2">Transaction Details:-</h1>
+  <div class="border-thin mb-4"></div>
+  <div class="space-y-3 mb-6">
+    <div><span class="font-semibold">Date:</span> {fmt_date_uba(tx)}</div>
+    <div><span class="font-semibold">Time:</span> {fmt_time_hms(tx)}</div>
+    <div><span class="font-semibold">Reference:</span> {rand_ref_S()}</div>
+    <div><span class="font-semibold">Amount:</span> {fmt_ngn_full(amount)}</div>
+    <div><span class="font-semibold">Status:</span> SUCCESSFUL</div>
+    <div><span class="font-semibold">Type:</span> Credit</div>
+  </div>
+  <h2 class="section-title mb-2">Accounts Details:-</h2>
+  <div class="border-thin mb-4"></div>
+  <div><span class="font-semibold">Narration:</span> TNF-Udtrend LLC/Transfer/ To {receiver}</div>
+</div>
+<div style="width:100%;line-height:0">
+  <img src="https://i.ibb.co/Pvmp72tz/photo-2025-10-05-21-15-20.jpg"
+       style="width:100%;height:auto;display:block;max-width:100%"
+       onerror="this.style.display='none'">
+</div>
+</body></html>"""
+
+
+# ── Roqqu ─────────────────────────────────────────────────────────────────────
+def tpl_roqqu(receiver: str, amount: int, tx: datetime) -> str:
+    usdt   = round(amount / 1600, 2)
+    tx_id  = random.randint(10_000_000, 99_999_999)
+    months = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Roqqu Transaction Receipt</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box;font-size:10px}}
+body{{font-family:'Inter',sans-serif;background:#fff;min-height:100vh}}
+.container{{max-width:400px;margin:0 auto;padding:32px 20px 0}}
+.amount-label{{color:#454545;margin-bottom:3px;font-weight:500;font-size:8px}}
+.amount-value{{color:#333;font-weight:900;letter-spacing:0.5px;line-height:1.2;font-size:14px}}
+.section-title{{color:#000;font-weight:700;margin-bottom:5px}}
+.detail-row{{display:flex;justify-content:space-between;align-items:flex-start;padding:12px 0}}
+.detail-label{{color:#666;flex-shrink:0;margin-right:16px}}
+.detail-value{{color:#333;text-align:right;flex:1;word-break:break-word}}
+</style></head>
+<body>
+<img src="https://hebbkx1anhila5yf.public.blob.vercel-storage.com/roqqu-header-w-100.jpg-gNB09nGLs4Hxbn9VtsgOHxOUq8nclB.jpeg"
+     alt="Roqqu Header" style="width:100%;height:auto;display:block" onerror="this.style.display='none'">
+<div class="container">
+  <div style="margin-bottom:32px">
+    <div class="amount-label">USDT Received</div>
+    <div class="amount-value">{usdt} USDT</div>
+  </div>
+  <h2 class="section-title">Transaction Details</h2>
+  <div style="background:#FAFAFA;padding:5px;border-radius:6px">
+    <div class="detail-row"><span class="detail-label">ID</span><span class="detail-value">{tx_id}</span></div>
+    <div class="detail-row"><span class="detail-label">Amount</span><span class="detail-value">{usdt} USDT</span></div>
+    <div class="detail-row"><span class="detail-label">Type</span><span class="detail-value">USDT Received</span></div>
+    <div class="detail-row"><span class="detail-label">Description</span><span class="detail-value">Received {usdt}3200 USDT from transfer</span></div>
+    <div class="detail-row"><span class="detail-label">Transaction date</span><span class="detail-value">{months[tx.month-1]} {tx.day}, {tx.year}</span></div>
+  </div>
+  <img src="https://hebbkx1anhila5yf.public.blob.vercel-storage.com/roqqu-footer-w-100.jpg-7boq5JInokxi7bRQmcdVOHw19dEjxy.jpeg"
+       alt="Roqqu Footer" style="width:100%;height:auto;display:block;margin-top:32px" onerror="this.style.display='none'">
+</div>
+</body></html>"""
+
+
+# ── Roqqu App (mobile app receipt, light/dark) ────────────────────────────────
+# CSS copied verbatim from the original Roqqu generator (receipt styles only).
+ROQQU_APP_CSS = """
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: "Open Sans", sans-serif; background: #f5f5f5; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+        .container { max-width: calc(600px); margin: 0 auto; min-height: 100vh; }
+        .receipt-view { display: none; background: #f5f5f5; min-height: 100vh; }
+        .receipt-view.show { display: block; }
+
+        .light-receipt { background: #fff; }
+        .light-receipt .receipt-header { display: flex; align-items: center; padding: 16px 20px; background: #fff; }
+        .light-receipt .back-btn { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; background: none; border: none; cursor: pointer; }
+        .light-receipt .back-btn svg { width: 20px; height: 20px; color: #1a1a1a; }
+        .light-receipt .header-title { flex: 1; text-align: center; font-size: 17px; font-weight: 600; color: #1a1a1a; margin-right: 32px; }
+        .light-receipt .receipt-content { padding: 20px; background: #fff; }
+        .light-receipt .crypto-logo-section { text-align: center; margin-bottom: 16px; }
+        .light-receipt .crypto-logo { width: calc(80px); height: calc(80px); border-radius: 50%; margin: 0 auto; background: #e1e0e0; object-fit: contain; padding: 8px; display: block; }
+        .light-receipt .amount-display { text-align: center; margin-bottom: 6px; }
+        .light-receipt .amount-value { font-size: 28px; font-weight: 900; color: #1a1a1a; }
+        .light-receipt .date-display { text-align: center; font-size: 14px; color: #888; margin-bottom: 24px; }
+        .light-receipt .share-buttons-container { width: 100%; max-width: 1700px; margin: 0 auto; }
+        .light-receipt .share-buttons-img { width: 100%; height: auto; transform: scale(1.1); margin-bottom: 10PX; border-radius: 16px; display: block; }
+        .light-receipt .description-card { background: #f5f5f5; margin-left: -3px; margin-right: -3px; border-radius: 16px; padding: 18px 20px; margin-bottom: 16px; }
+        .light-receipt .description-label { font-size: 13px; color: #888; margin-bottom: 6px; }
+        .light-receipt .description-value { font-size: 13px; font-weight: 500; color: #1a1a1a; }
+        .light-receipt .details-card { background: #f5f5f5; margin-left: -3px; margin-right: -3px; border-radius: 16px; padding: 6px 0; }
+        .light-receipt .detail-row { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #f0eeee; }
+        .light-receipt .detail-row:last-child { border-bottom: none; }
+        .light-receipt .detail-label { font-size: 14px; color: #888; }
+        .light-receipt .detail-value { font-size: 14px; font-weight: 600; color: #1a1a1a; text-align: right; }
+
+        .dark-receipt { background: #0a0b0d; }
+        .dark-receipt .receipt-header { display: flex; align-items: center; padding: 16px 20px; background: #0a0b0d; }
+        .dark-receipt .back-btn { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; background: none; border: none; cursor: pointer; }
+        .dark-receipt .back-btn svg { width: 20px; height: 20px; color: #fff; }
+        .dark-receipt .header-title { flex: 1; text-align: center; font-size: 17px; font-weight: 600; color: #fff; margin-right: 32px; }
+        .dark-receipt .receipt-content { padding: 20px; background: #0a0b0d; }
+        .dark-receipt .crypto-logo-section { text-align: center; margin-bottom: 16px; }
+        .dark-receipt .crypto-logo { width: calc(80px); height: calc(80px); border-radius: 50%; margin: 0 auto; background: #373A3F; object-fit: contain; padding: 8px; display: block; }
+        .dark-receipt .amount-display { text-align: center; margin-bottom: 6px; }
+        .dark-receipt .amount-value { font-size: 28px; font-weight: 800; color: #fff; }
+        .dark-receipt .date-display { text-align: center; font-size: 14px; color: #888; margin-bottom: 24px; }
+        .dark-receipt .share-buttons-container { width: 100%; max-width: 1700px; margin: 0 auto; }
+        .dark-receipt .share-buttons-img { width: 100%; height: auto; transform: scale(1.1); margin-bottom: 10PX; border-radius: 16px; display: block; }
+        .dark-receipt .description-card { background: #14151a; border-radius: 16px; margin-left: -3PX; margin-right: -3PX; padding: 18px 20px; margin-bottom: 16px; }
+        .dark-receipt .description-label { font-size: 13px; color: #888; margin-bottom: 6px; }
+        .dark-receipt .description-value { font-size: 13px; font-weight: 500; color: #fff; }
+        .dark-receipt .details-card { background: #14151a; margin-left: -3PX; margin-right: -3PX; border-radius: 16px; padding: 6px 0; }
+        .dark-receipt .detail-row { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #131313; }
+        .dark-receipt .detail-row:last-child { border-bottom: none; }
+        .dark-receipt .detail-label { font-size: 14px; color: #888; }
+        .dark-receipt .detail-value { font-size: 14px; font-weight: 400; color: #fff; text-align: right; }
+"""
+
+ROQQU_SHARE_IMG = {
+    "light": "https://hebbkx1anhila5yf.public.blob.vercel-storage.com/Roqqu%20Light%20Sahre%20button-VOruesCeRGuzRqzOwlkoicSZXm85UY.jpg",
+    "dark":  "https://hebbkx1anhila5yf.public.blob.vercel-storage.com/Roqqu%20Dark%20Share%20button-TMptDnr04cv3dZtAzQSmCm6eWfi7tg.jpg",
+}
+
+
+def fmt_roqqu_date(tx: datetime) -> str:
+    """Matches the original JS formatDate: 'April 12, 2026 10:40 PM'."""
+    months = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+    h = tx.hour % 12 or 12
+    ampm = "PM" if tx.hour >= 12 else "AM"
+    return f"{months[tx.month-1]} {tx.day}, {tx.year} {h}:{tx.minute:02d} {ampm}"
+
+
+def tpl_roqqu_app(receiver: str, amount: int, tx: datetime, theme: str = "light") -> str:
+    usdt        = round(amount / 1600, 2)
+    usdt_str    = f"{usdt:g}"
+    usdt_6dp    = f"{usdt:.6f}"
+    tx_id       = "101" + "".join(random.choices("0123456789", k=6))
+    date_str    = fmt_roqqu_date(tx)
+    back_color  = "#1a1a1a" if theme == "light" else "#fff"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Roqqu Receipt</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,300..800;1,300..800&display=swap" rel="stylesheet">
+    <script type="module" src="https://unpkg.com/ionicons@7.1.0/dist/ionicons/ionicons.esm.js"></script>
+    <script nomodule src="https://unpkg.com/ionicons@7.1.0/dist/ionicons/ionicons.js"></script>
+    <style>{ROQQU_APP_CSS}</style>
+</head>
+<body>
+    <div class="container">
+        <div class="receipt-view {theme}-receipt show">
+            <div class="receipt-header">
+                <button class="back-btn">
+                    <ion-icon name="chevron-back-outline" style="font-size: 24px; color: {back_color};"></ion-icon>
+                </button>
+                <span class="header-title">Transaction detail</span>
+            </div>
+
+            <div class="receipt-content">
+                <div class="crypto-logo-section">
+                    <img class="crypto-logo" src="https://www.coinmetro.com/_next/static/media/USDT.e5b6b9e8.svg" alt="Crypto">
+                </div>
+
+                <div class="amount-display">
+                    <span class="amount-value">{usdt_str} USDT</span>
+                </div>
+
+                <div class="date-display">{date_str}</div>
+
+                <div class="share-buttons-container">
+                    <img src="{ROQQU_SHARE_IMG[theme]}" alt="Share Buttons" class="share-buttons-img">
+                </div>
+
+                <div class="description-card">
+                    <div class="description-label">Description</div>
+                    <div class="description-value">Received {usdt_6dp} USDT from transfer</div>
+                </div>
+
+                <div class="details-card">
+                    <div class="detail-row">
+                        <span class="detail-label">ID</span>
+                        <span class="detail-value">{tx_id}</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="detail-label">Amount</span>
+                        <span class="detail-value">{usdt_str} USDT</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="detail-label">Type</span>
+                        <span class="detail-value">USDT Received</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="detail-label">Transaction date</span>
+                        <span class="detail-value">{date_str}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+def tpl_roqqu_app_any(receiver: str, amount: int, tx: datetime) -> str:
+    """Roqqu App counts as one template; the light/dark theme is picked 50/50 here."""
+    theme = random.choice(["light", "dark"])
+    logger.info(f"🎨 Roqqu App theme: {theme.title()}")
+    return tpl_roqqu_app(receiver, amount, tx, theme=theme)
+
+
+# ── Binance ───────────────────────────────────────────────────────────────────
+BINANCE_NETWORK = "TRON (TRC20)"
+BINANCE_ACCOUNTS = ["Funding Account", "Spot Account"]
+_HEX = "0123456789abcdef"
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def binance_address(network: str) -> str:
+    if "TRC20" in network or "TRON" in network:
+        return "T" + "".join(random.choices(_B58, k=33))
+    if "Solana" in network:
+        return "".join(random.choices(_B58, k=44))
+    if "Bitcoin" in network:
+        return "bc1q" + "".join(random.choices(_HEX, k=38))
+    return "0x" + "".join(random.choices(_HEX, k=40))
+
+
+def tpl_binance(receiver: str, amount: int, tx: datetime, theme: str = "dark") -> str:
+    body_bg  = "#fff" if theme == "light" else "#0B0E11"
+    usdt     = round(amount / 1600, 2)
+    network  = BINANCE_NETWORK
+    account  = random.choice(BINANCE_ACCOUNTS)
+    address  = binance_address(network)
+    tx_hash  = "".join(random.choices(_HEX, k=64))
+    time_str = tx.strftime("%Y-%m-%d %H:%M:%S")
+    copy_svg = ('<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+                '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>')
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Binance - Deposit Details</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {{
+            theme: {{
+                extend: {{
+                    fontFamily: {{ 'sans': ['Inter', 'sans-serif'] }},
+                    colors: {{
+                        binbg: '#0B0E11',
+                        bincard: '#1E2329',
+                        bingray: '#848E9C',
+                        bingreen: '#0ECB81',
+                        binyellow: '#FCD535',
+                        binborder: '#2B3139',
+                    }}
+                }}
+            }}
+        }}
+    </script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; -webkit-font-smoothing: antialiased; }}
+        body {{ font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background-color: {body_bg}; }}
+        ::-webkit-scrollbar {{ width: 0; }}
+        body.dark .receipt-bg {{ background-color: #0B0E11; }}
+        body.dark .receipt-title {{ color: #fff; }}
+        body.dark .receipt-qty-label {{ color: #848E9C; }}
+        body.dark .receipt-qty-val {{ color: #fff; }}
+        body.dark .receipt-label {{ color: #848E9C; }}
+        body.dark .receipt-value {{ color: #fff; }}
+        body.dark .receipt-btn-border {{ border-color: #2B3139; color: #fff; }}
+        body.dark .receipt-back svg {{ stroke: #fff; }}
+        body.dark .receipt-copy svg {{ stroke: #848E9C; }}
+        body.dark .succeeded-pill {{ background-color: #0B0E11; }}
+        body.light .receipt-bg {{ background-color: #fff; }}
+        body.light .receipt-title {{ color: #1E2329; }}
+        body.light .receipt-qty-label {{ color: #848E9C; }}
+        body.light .receipt-qty-val {{ color: #1E2329; }}
+        body.light .receipt-label {{ color: #848E9C; }}
+        body.light .receipt-value {{ color: #1E2329; }}
+        body.light .receipt-btn-border {{ border-color: #EAECEF; color: #1E2329; }}
+        body.light .receipt-back svg {{ stroke: #1E2329; }}
+        body.light .receipt-copy svg {{ stroke: #AEB4BC; }}
+        body.light .succeeded-pill {{ background-color: #FFF; }}
+        .receipt-view {{ display: flex; }}
+    </style>
+</head>
+<body class="{theme}">
+    <div class="receipt-view receipt-bg" style="max-width: 430px; margin: 0 auto; min-height: 100vh; flex-direction: column;">
+
+        <!-- Top Bar -->
+        <div class="flex items-center px-5 receipt-bg" style="padding-top: 16px; padding-bottom: 14px;">
+            <button class="mr-4 receipt-back">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/>
+                </svg>
+            </button>
+            <span class="receipt-title font-semibold text-base flex-1 text-center" style="margin-right: 24px;">Deposit Details</span>
+        </div>
+
+        <!-- Quantity Section -->
+        <div class="flex flex-col items-center receipt-bg" style="padding: 28px 24px 32px;">
+            <p class="receipt-qty-label text-sm mb-2">Quantity</p>
+            <p class="receipt-qty-val font-bold mb-3" style="font-size: 28px; letter-spacing: -0.5px;">{usdt} USDT</p>
+            <div class="succeeded-pill inline-flex items-center gap-1.5 px-3 py-1.5" style="border-radius: 20px;">
+                <svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <circle cx="9" cy="9" r="8" fill="rgba(14,203,129,0.15)" stroke="#0ECB81" stroke-width="1.5"/>
+                    <path d="M5.5 9.2L7.8 11.5L12.5 6.5" stroke="#0ECB81" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span style="color: #0ECB81; font-size: 13px; font-weight: 600; letter-spacing: 0.01em;">Succeeded</span>
+            </div>
+        </div>
+
+        <!-- Details Section -->
+        <div class="px-6" style="padding-top: 16px;">
+            <div class="flex justify-between items-center" style="padding: 16px 0;">
+                <span class="receipt-label text-sm">Deposit Account</span>
+                <span class="receipt-value text-sm font-medium text-right">{account}</span>
+            </div>
+            <div class="flex justify-between items-center" style="padding: 16px 0;">
+                <span class="receipt-label text-sm">Chain Type</span>
+                <span class="receipt-value text-sm font-medium text-right">{network}</span>
+            </div>
+            <div class="flex justify-between items-center" style="padding: 16px 0;">
+                <span class="receipt-label text-sm">Time</span>
+                <span class="receipt-value text-sm font-medium text-right">{time_str}</span>
+            </div>
+            <div class="flex justify-between items-start" style="padding: 16px 0;">
+                <span class="receipt-label text-sm flex-shrink-0" style="margin-right: 20px;">Deposit Address</span>
+                <div class="flex items-start gap-1.5">
+                    <span class="receipt-value text-sm font-medium text-right break-all" style="line-height: 1.65; max-width: 220px; filter: blur(4px); user-select: none;">{address}</span>
+                    <button class="receipt-copy flex-shrink-0 mt-0.5">{copy_svg}</button>
+                </div>
+            </div>
+            <div class="flex justify-between items-start" style="padding: 16px 0;">
+                <span class="receipt-label text-sm flex-shrink-0" style="margin-right: 20px;">Transaction Hash</span>
+                <div class="flex items-start gap-1.5">
+                    <span class="receipt-value text-sm font-medium text-right break-all" style="line-height: 1.65; max-width: 220px; filter: blur(4px); user-select: none;">{tx_hash}</span>
+                    <button class="receipt-copy flex-shrink-0 mt-0.5">{copy_svg}</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="flex-1"></div>
+
+        <div class="px-6" style="padding-bottom: 44px;">
+            <button class="receipt-btn-border w-full py-3.5 rounded-full font-semibold text-sm" style="background: transparent; border-width: 1.5px; border-style: solid;">
+                View in Blockchain Explorer
+            </button>
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+def tpl_binance_light(receiver: str, amount: int, tx: datetime) -> str:
+    return tpl_binance(receiver, amount, tx, theme="light")
+
+
+
+# ── Kuda ──────────────────────────────────────────────────────────────────────
+def tpl_kuda(receiver: str, amount: int, tx: datetime, kuda_acct: str = "9720396770") -> str:
+    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    paid_date = f"{months[tx.month-1]} {tx.day}, {tx.year}"
+    h = tx.hour % 12 or 12
+    ampm = "PM" if tx.hour >= 12 else "AM"
+    paid_time = f"{h}:{tx.strftime('%M')} {ampm}"
+    seg = [8, 4, 4, 4, 12]
+    tx_ref = "ITR-" + "-".join("".join(random.choices("0123456789abcdef", k=n)) for n in seg)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Lato:ital,wght@0,100;0,300;0,400;0,700;0,900;1,100;1,300;1,400;1,700;1,900&display=swap" rel="stylesheet">
+    <title>Kuda</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: "Lato", sans-serif;
+            background-color: #FFFFFF;
+        }}
+
+        .container {{
+            max-width: 400px;
+            margin: 0 auto;
+            background: white;
+            min-height: 100vh;
+        }}
+
+        .header img {{
+            width: 100%;
+            display: block;
+        }}
+
+        .details {{
+            padding: 10px;
+        }}
+
+        .amount-section {{
+            text-align: center;
+            margin-bottom: 0px;
+        }}
+
+        .detail-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            padding: 8px 0;
+            border-bottom: 1.3px solid #CACACA;
+        }}
+
+        .detail-label {{
+            color: #AAAAAA;
+            font-size: 10px;
+            flex: 1;
+        }}
+
+        .detail-value {{
+            text-align: right;
+            flex: 1;
+            font-size: 10px;
+            color: #000;
+            font-weight: 450;
+        }}
+
+        .detail-value .sub-text {{
+            color: #999;
+            font-size: 10px;
+            display: block;
+            margin-top: 2px;
+        }}
+
+        .sub-text {{
+            font-weight: normal;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="https://i.ibb.co/mCzs4NRm/Kuda-Header.jpg" alt="" srcset="" width="100%">
+        </div>
+
+        <div class="details">
+            <div class="amount-section">
+                <div class="amount-label" style="font-size: 10px; font-weight: 600;">Transaction Amount</div>
+                <div class="amount" style="font-size: 14px; font-weight: 1000;">₦{fmt_ngn(amount)}</div>
+            </div>
+
+            <div class="detail-row">
+                <div class="detail-label">Beneficiary Details</div>
+                <div class="detail-value">
+                    <span>{receiver}</span>
+                    <span class="sub-text">Kuda | <span>{mask_account(kuda_acct)}</span></span>
+                </div>
+            </div>
+
+            <div class="detail-row">
+                <div class="detail-label">Sender Details</div>
+                <div class="detail-value">
+                    <span>Udtrend LLC</span>
+                    <span class="sub-text">Kuda | <span>{mask_account("10121")}</span></span>
+                </div>
+            </div>
+
+            <div class="detail-row">
+                <div class="detail-label">Paid On</div>
+                <div class="detail-value">
+                    <span>{paid_date}</span>
+                    <span class="sub-text">{paid_time}</span>
+                </div>
+            </div>
+
+            <div class="detail-row">
+                <div class="detail-label">Fees</div>
+                <div class="detail-value">₦0.00</div>
+            </div>
+
+            <div class="detail-row">
+                <div class="detail-label">Description</div>
+                <div class="detail-value">Transfer from Udtrend LLC</div>
+            </div>
+
+            <div class="detail-row">
+                <div class="detail-label">Transaction Reference</div>
+                <div class="detail-value">{tx_ref}</div>
+            </div>
+
+            <div class="detail-row">
+                <div class="detail-label">Payment Type</div>
+                <div class="detail-value">Local Funds Transfer</div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <img src="https://i.ibb.co/rRTcWN4g/photo-5877306125311479666-w.jpg" alt="" srcset="" width="100%">
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+# ── FairMoney ─────────────────────────────────────────────────────────────────
+FAIRMONEY_SENDER_BANKS = ["PAYSTACK-TITAN", "Moniepoint", "OPAY", "Palmpay", "Wema Bank"]
+
+
+def tpl_fairmoney(receiver: str, amount: int, tx: datetime, fm_acct: str = "2001499853") -> str:
+    months = ["January","February","March","April","May","June","July",
+              "August","September","October","November","December"]
+    h = tx.hour % 12 or 12
+    ampm = "PM" if tx.hour >= 12 else "AM"
+    date_time = f"{tx.day} {months[tx.month-1]} {tx.year}, {h}:{tx.strftime('%M')} {ampm}"
+    transaction_id = "940" + str(random.randint(100000, 999999))
+    sender_name = "Udtrend LLC"
+    sender_bank = random.choice(FAIRMONEY_SENDER_BANKS)
+    sender_acct = rand_digits(10)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>FairMoney Receipt</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script type="module" src="https://unpkg.com/ionicons@7.1.0/dist/ionicons/ionicons.esm.js"></script>
+    <script nomodule src="https://unpkg.com/ionicons@7.1.0/dist/ionicons/ionicons.js"></script>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+
+        body {{
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #f5f5f5;
+            min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
+        }}
+
+        .container {{
+            width: calc(100%);
+            max-width: calc(420px);
+            margin: 0 auto;
+        }}
+
+        /* ==================== RECEIPT STYLES ==================== */
+        .receipt-view {{
+            display: block;
+            background: #fff;
+            min-height: 100vh;
+        }}
+
+        .receipt-header {{
+            display: flex;
+            align-items: center;
+            padding: 16px 20px;
+            background: #fff;
+        }}
+
+        .back-btn {{
+            width: 40px;
+            height: 40px;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+
+        .back-btn ion-icon {{
+            font-size: 24px;
+            color: #1a1a1a;
+        }}
+
+        .receipt-content {{
+            padding: 0 20px;
+            margin-bottom: 0;
+        }}
+
+        /* Main Card */
+        .main-card {{
+            width: calc(100% - 0px);
+            background: #fff;
+            border-radius: 16px;
+            border: 1px solid #e8e8e8;
+            padding: 20px;
+            margin-bottom: 0;
+        }}
+
+        .card-top {{
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 4px;
+        }}
+
+        .amount {{
+            font-size: 19px;
+            font-weight: 700;
+            color: #1a1a1a;
+            margin-bottom: 5PX;
+        }}
+
+        .bank-icon {{
+            width: 50px;
+            height: 50px;
+            background: #f5f5f5;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+
+        .bank-icon img {{
+            width: 28px;
+            height: 28px;
+            color: #666;
+        }}
+
+        .from-name {{
+            font-size: 16px;
+            font-weight: 700;
+            color: #1a1a1a;
+            margin-bottom: 4px;
+        }}
+
+        .date-time {{
+            font-size: 13px;
+            color: #888;
+            margin-bottom: 16px;
+        }}
+
+        .status-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #3bb54a;
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }}
+
+        .status-badge svg {{
+            width: 15px;
+            height: 15px;
+        }}
+
+        .divider {{
+            height: 1px;
+            background: #e8e8e8;
+            margin: 16px 0;
+        }}
+
+        .section-title {{
+            font-size: 14px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 16px;
+        }}
+
+        .detail-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 14px;
+        }}
+
+        .detail-row:last-child {{
+            margin-bottom: 0;
+        }}
+
+        .detail-label {{
+            font-size: 14px;
+            color: #666;
+        }}
+
+        .detail-value {{
+            font-size: 14px;
+            color: #1a1a1a;
+            font-weight: 500;
+            text-align: right;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .copy-icon {{
+            width: 15px;
+            height: 15px;
+            color: #3bb54a;
+            cursor: pointer;
+        }}
+
+        .notes-section {{
+            margin-top: 16px;
+        }}
+
+        .notes-title {{
+            font-size: 14px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+        }}
+
+        .notes-text {{
+            font-size: 14px;
+            color: #666;
+        }}
+
+        /* Bottom Image */
+        .bottom-image-container {{
+            width: calc(100% - 0px);
+            margin: 0;
+            padding: 0 4px;
+            height: auto;
+            transform: translateY(-50px);
+        }}
+
+        .bottom-image {{
+            width: calc(100% - 0px);
+            display: block;
+            margin: 0;
+            padding: 0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="receiptView" class="receipt-view">
+            <div class="receipt-header">
+                <button class="back-btn">
+                    <ion-icon name="arrow-back-outline"></ion-icon>
+                </button>
+            </div>
+
+            <div class="receipt-content">
+                <div class="main-card">
+                    <div class="card-top">
+                        <div>
+                            <div class="amount">+N{amount:,}</div>
+                            <div class="from-name">From {sender_name}</div>
+                            <div class="date-time">{date_time}</div>
+                        </div>
+                        <div class="bank-icon">
+                            <img src="https://i.postimg.cc/pLrvtnrx/bank.jpg">
+                        </div>
+                    </div>
+
+                    <div class="status-badge">
+                        <span>Transaction successful</span>
+                        <svg viewBox="0 0 24 24" fill="#3bb54a">
+                            <circle cx="12" cy="12" r="10"/>
+                            <path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="2" fill="none"/>
+                        </svg>
+                    </div>
+
+                    <div class="divider"></div>
+
+                    <div class="section-title">Transaction details</div>
+
+                    <div class="detail-row">
+                        <span class="detail-label">Transaction ID</span>
+                        <span class="detail-value">
+                            <svg class="copy-icon" viewBox="0 0 24 24" fill="none" stroke="#3bb54a" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                            </svg>
+                            <span>{transaction_id}</span>
+                        </span>
+                    </div>
+
+                    <div class="detail-row">
+                        <span class="detail-label">Transaction type</span>
+                        <span class="detail-value">Incoming Transfer</span>
+                    </div>
+
+                    <div class="detail-row">
+                        <span class="detail-label">From</span>
+                        <span class="detail-value">{sender_name}</span>
+                    </div>
+
+                    <div class="detail-row">
+                        <span class="detail-label">Sender's bank</span>
+                        <span class="detail-value">{sender_bank}&nbsp;&bull; <span style="filter: blur(4px); display: inline-block; white-space: nowrap; user-select: none;">{sender_acct}</span></span>
+                    </div>
+
+                    <div class="detail-row">
+                        <span class="detail-label">To</span>
+                        <span class="detail-value">{receiver.upper()}</span>
+                    </div>
+
+                    <div class="detail-row">
+                        <span class="detail-label">Recipient Bank</span>
+                        <span class="detail-value">FairMoney Bank&nbsp;&bull; <span style="filter: blur(4px); display: inline-block; white-space: nowrap; user-select: none;">{fm_acct}</span></span>
+                    </div>
+
+                    <div class="divider"></div>
+
+                    <div class="notes-section">
+                        <div class="notes-title">Notes</div>
+                        <div class="notes-text">Transfer from {sender_name}</div>
+                    </div>
+
+                    <div class="divider"></div>
+                </div>
+            </div>
+
+            <div class="bottom-image-container">
+                <img src="https://i.postimg.cc/MKvmNp5q/FM-BOTTOM.jpg" alt="FairMoney Bottom" class="bottom-image">
+            </div>
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+
+# ── Udtrend LLC Withdrawal Page (paired with each bank receipt) ──────────────────
+# Bank details shown on the withdrawal page, matched to the receipt being posted.
+UDTREND_BANKS = {
+    "UBA Classic": ("United Bank for Africa", None),
+    "UBA Modern":  ("United Bank for Africa", None),
+    "Kuda":        ("Kuda Microfinance Bank", None),
+    "Sparkle":     ("Sparkle", None),
+    "Sparkle App": ("Sparkle", None),
+    "Access Bank": ("Access Bank", None),
+    "FairMoney":   ("FairMoney Microfinance Bank", None),
+    "Sterling Bank": ("Sterling Bank", None),
+    "ALAT":        ("Wema Bank", None),
+    "Moniepoint":  ("Moniepoint Microfinance Bank", None),
+    "OPay":        ("Opay", None),
+    "Zenith Bank": ("Zenith Bank Plc", None),
+}
+
+# NGN value of 1 DAI, applied to the gross amount (gross / rate = DAI).
+DAI_RATE = 1445
+
+# NGN value of 1 USDC on the Udtrend withdrawal page (naira / rate = USDC).
+USDC_RATE = 1445
+
+
+# ── High-conversion caption variants (shuffle-rotated each post) ──────────────
+# The alert headline + credited line stay fixed; the hook and CTA rotate via a
+# shuffle-bag so no line repeats until its whole pool is exhausted.
+CAPTION_ALERTS = [
+    "🚨 <b>Credit Alert!</b>",
+    "💸 <b>Payment Confirmed!</b>",
+    "✅ <b>Withdrawal Successful!</b>",
+    "🔔 <b>New Credit Alert!</b>",
+    "⚡ <b>Instant Payout!</b>",
+    "💰 <b>Cash Out Successful!</b>",
+    "🎉 <b>Another Happy Earner!</b>",
+    "📥 <b>Funds Received!</b>",
+]
+
+CAPTION_HOOKS = [
+    "Don't hold back any longer — what are you waiting for? 💰",
+    "Your next payout could be loading right now. 🚀",
+    "Thousands are cashing out daily — don't get left behind. 💵",
+    "The earlier you start, the more you earn. ⏳",
+    "Real people. Real payouts. Real fast. ���",
+    "Stop watching others win — your turn is now. 🏆",
+    "Financial freedom is one click away. 🔓",
+    "Why wait for payday when you can get paid today? 💳",
+    "This could be your alert tomorrow. Start now. 📈",
+    "No stories, no delays — just instant payouts. ⚡",
+    "Small start today, big payout tomorrow. 🌱",
+    "Join the winners already smiling to the bank. 😎",
+    "Opportunities like this don't wait. Neither should you. ���",
+    "Your money should work as hard as you do. 💪",
+]
+
+CAPTION_CTAS = [
+    "Go to <a href='https://udtrend.com'>udtrend.com</a> and get started today.",
+    "Start earning now 👉 <a href='https://udtrend.com'>udtrend.com</a>",
+    "Join thousands cashing out 👉 <a href='https://udtrend.com'>udtrend.com</a>",
+    "Claim your spot today 👉 <a href='https://udtrend.com'>udtrend.com</a>",
+    "Don't miss out — visit <a href='https://udtrend.com'>udtrend.com</a> now.",
+    "Get started in minutes 👉 <a href='https://udtrend.com'>udtrend.com</a>",
+    "Your journey starts here 👉 <a href='https://udtrend.com'>udtrend.com</a>",
+    "Take the first step 👉 <a href='https://udtrend.com'>udtrend.com</a>",
+    "Sign up free today 👉 <a href='https://udtrend.com'>udtrend.com</a>",
+    "Be the next success story 👉 <a href='https://udtrend.com'>udtrend.com</a>",
+]
+
+
+class _ShuffleBag:
+    """Yields items in random order with no repeats until the pool is exhausted,
+    then reshuffles. Avoids repeating the last item across a reshuffle."""
+    def __init__(self, items: list[str]):
+        self._items = list(items)
+        self._bag: list[str] = []
+        self._last: str | None = None
+
+    def draw(self) -> str:
+        if not self._bag:
+            self._bag = list(self._items)
+            random.shuffle(self._bag)
+            # Avoid back-to-back repeat when a new bag starts with the last item.
+            if len(self._bag) > 1 and self._bag[-1] == self._last:
+                self._bag[0], self._bag[-1] = self._bag[-1], self._bag[0]
+        item = self._bag.pop()
+        self._last = item
+        return item
+
+
+_ALERT_BAG = _ShuffleBag(CAPTION_ALERTS)
+_HOOK_BAG  = _ShuffleBag(CAPTION_HOOKS)
+_CTA_BAG   = _ShuffleBag(CAPTION_CTAS)
+
+
+def build_caption(credited_line: str) -> str:
+    """Assemble a high-conversion caption around a fixed credited line,
+    rotating the alert, hook, and CTA via shuffle-bags (no repeats until
+    each pool is exhausted)."""
+    alert = _ALERT_BAG.draw()
+    hook  = _HOOK_BAG.draw()
+    cta   = _CTA_BAG.draw()
+    return (
+        f"{alert}\n\n"
+        f"<b>{credited_line}</b>\n\n"
+        f"<blockquote>{hook}</blockquote>\n\n"
+        f"<b>{cta}</b>"
+    )
+
+
+def udtrend_details_for(tpl_name: str, receiver: str, acct: str = "") -> tuple[str, str, str]:
+    """Return (bank_name, account_number, account_name) matching the receipt."""
+    bank, _ = UDTREND_BANKS.get(tpl_name, ("United Bank for Africa", None))
+    # If no account was passed (None), generate a random one
+    if not acct:
+        acct = rand_digits(10)
+    return bank, acct, receiver
+
+
+def tpl_udtrend(amount: int, tx: datetime, bank_name: str,
+                account_number: str, account_name: str) -> str:
+    """
+    Udtrend 'Transaction Details' (withdrawal) page, paired with a bank receipt.
+    The USDC amount is derived from the receipt's naira amount via USDC_RATE.
+    """
+    usdc_str  = f"{amount / USDC_RATE:,.2f}"
+    reference = "WIT-" + str(random.randint(1, 99_999)).zfill(6)
+    months    = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    hour12    = tx.hour % 12 or 12
+    ampm      = "AM" if tx.hour < 12 else "PM"
+    date_str  = f"{months[tx.month-1]} {tx.day}, {tx.year} at {hour12}:{tx.minute:02d} {ampm}"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Transaction Details - Udtrend</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Signika+Negative:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>
+        tailwind.config = {{
+            theme: {{
+                extend: {{
+                    fontFamily: {{
+                        sans: ['Signika Negative', 'sans-serif'],
+                    }},
+                    colors: {{
+                        primary: {{
+                            50: '#eff6ff', 100: '#dbeafe', 200: '#bfdbfe', 300: '#93c5fd', 400: '#60a5fa',
+                            500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8', 800: '#1e40af', 900: '#1e3a8a',
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    </script>
+    <style>
+        body {{
+            font-family: 'Signika Negative', sans-serif;
+            padding-bottom: 70px;
+            background: linear-gradient(180deg, #f8fafc 0%, #eff6ff 100%);
+            min-height: 100vh;
+        }}
+        .bottom-nav-item {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 44px;
+            padding: 0 14px;
+            border-radius: 9999px;
+            color: #94a3b8;
+        }}
+        .bottom-nav-item i {{ font-size: 18px; line-height: 1; }}
+        .page-hero {{
+            background:
+                radial-gradient(110% 130% at 92% 0%, rgba(96,165,250,0.55) 0%, rgba(96,165,250,0) 55%),
+                radial-gradient(120% 100% at 0% 120%, rgba(56,189,248,0.4) 0%, rgba(56,189,248,0) 55%),
+                linear-gradient(135deg, #2563eb 0%, #1d4ed8 55%, #1e3a8a 100%);
+        }}
+        .ud-hero-grid {{
+            background-image:
+                linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px);
+            background-size: 26px 26px;
+            -webkit-mask-image: radial-gradient(120% 90% at 80% 0%, #000 35%, transparent 80%);
+            mask-image: radial-gradient(120% 90% at 80% 0%, #000 35%, transparent 80%);
+        }}
+        .ud-bar {{ width: 4px; height: 16px; border-radius: 9999px; background: linear-gradient(to bottom, #3b82f6, #1d4ed8); display: inline-block; }}
+    </style>
+</head>
+<body class="min-h-screen">
+<main class="px-4 py-4">
+
+<a href="#" class="inline-flex items-center gap-2 text-gray-600 text-sm font-medium mb-3">
+    <i class="fas fa-arrow-left"></i>
+    Back to Transactions
+</a>
+
+<div class="page-hero rounded-2xl p-4 mb-3 text-white relative overflow-hidden shadow-lg shadow-blue-900/25">
+    <div class="ud-hero-grid absolute inset-0 pointer-events-none"></div>
+    <div class="relative flex flex-col items-center text-center">
+        <div class="w-11 h-11 bg-gradient-to-br from-amber-500 to-orange-600 rounded-xl flex items-center justify-center shadow-lg mb-2 ring-4 ring-white/15">
+            <i class="fas fa-money-bill-transfer text-white text-lg"></i>
+        </div>
+        <p class="text-blue-100 text-sm">Withdrawal</p>
+        <p class="text-2xl font-bold mt-0.5">-${usdc_str} <span class="text-sm font-medium text-blue-100">USDC</span></p>
+        <span class="inline-flex items-center gap-1.5 mt-2 px-3 py-1 rounded-full text-xs font-semibold bg-white/15 backdrop-blur border border-white/20">
+            <i class="fas fa-circle-check"></i>
+            Approved
+        </span>
+    </div>
+</div>
+
+<div class="bg-white rounded-2xl shadow-sm ring-1 ring-gray-100 overflow-hidden mb-3">
+    <div class="px-4 py-2.5 border-b border-gray-100">
+        <h2 class="text-gray-800 font-bold text-[15px] flex items-center gap-2"><span class="ud-bar"></span>Details</h2>
+    </div>
+    <dl class="divide-y divide-gray-100">
+        <div class="flex items-center justify-between px-4 py-2.5">
+            <dt class="text-sm text-gray-500">Reference ID</dt>
+            <dd class="text-sm font-semibold text-gray-800 font-mono">{reference}</dd>
+        </div>
+        <div class="flex items-center justify-between px-4 py-2.5">
+            <dt class="text-sm text-gray-500">Type</dt>
+            <dd class="text-sm font-semibold text-gray-800">Withdrawal</dd>
+        </div>
+        <div class="flex items-start justify-between px-4 py-2.5 gap-4">
+            <dt class="text-sm text-gray-500">Description</dt>
+            <dd class="text-sm font-medium text-gray-700 text-right">Funds withdrawn from your account</dd>
+        </div>
+        <div class="flex items-center justify-between px-4 py-2.5">
+            <dt class="text-sm text-gray-500">Amount</dt>
+            <dd class="text-sm font-bold text-red-600">-${usdc_str}</dd>
+        </div>
+        <div class="flex items-center justify-between px-4 py-2.5">
+            <dt class="text-sm text-gray-500">Status</dt>
+            <dd>
+                <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700">
+                    <i class="fas fa-circle-check text-[10px]"></i>
+                    Approved
+                </span>
+            </dd>
+        </div>
+        <div class="flex items-center justify-between px-4 py-2.5">
+            <dt class="text-sm text-gray-500">Date &amp; Time</dt>
+            <dd class="text-sm font-semibold text-gray-800 text-right">{date_str}</dd>
+        </div>
+        <div class="flex items-center justify-between px-4 py-2.5">
+            <dt class="text-sm text-gray-500">Payment Method</dt>
+            <dd class="text-sm font-semibold text-gray-800">Bank Transfer</dd>
+        </div>
+        <div class="px-4 py-2.5">
+            <dt class="text-sm text-gray-500 mb-2">Payment Details</dt>
+            <dd class="rounded-xl bg-gray-50 border border-gray-100 divide-y divide-gray-100 overflow-hidden">
+                <div class="flex items-start justify-between gap-3 px-3 py-2">
+                    <span class="text-xs font-medium text-gray-500 flex-shrink-0">Bank Name</span>
+                    <span class="text-sm font-semibold text-gray-800 text-right break-all">{bank_name}</span>
+                </div>
+                <div class="flex items-start justify-between gap-3 px-3 py-2">
+                    <span class="text-xs font-medium text-gray-500 flex-shrink-0">Account Name</span>
+                    <span class="text-sm font-semibold text-gray-800 text-right break-all">{account_name.upper()}</span>
+                </div>
+                <div class="flex items-start justify-between gap-3 px-3 py-2">
+                    <span class="text-xs font-medium text-gray-500 flex-shrink-0">Account Number</span>
+                    <span class="text-sm font-semibold text-gray-800 text-right" style="filter: blur(4px); display: inline-block; white-space: nowrap; user-select: none;">{account_number}</span>
+                </div>
+            </dd>
+        </div>
+    </dl>
+</div>
+
+</main>
+
+<nav class="fixed bottom-3 left-0 right-0 z-40 flex justify-center px-4">
+    <div class="w-[74%] bg-white rounded-full shadow-lg shadow-slate-300/50 ring-1 ring-gray-100 flex items-center justify-between px-3 py-1.5">
+        <span class="bottom-nav-item"><i class="fas fa-house"></i></span>
+        <span class="bottom-nav-item"><i class="fas fa-microchip"></i></span>
+        <span class="bottom-nav-item"><i class="fas fa-dharmachakra"></i></span>
+        <span class="bottom-nav-item"><i class="fas fa-money-bill-transfer"></i></span>
+        <span class="bottom-nav-item"><i class="fas fa-user"></i></span>
+    </div>
+</nav>
+</body>
+</html>"""
+
+
+# ── Sparkle ───────────────────────────────────────────────────────────────────
+def tpl_sparkle(receiver: str, amount: int, tx: datetime) -> str:
+    months = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+    days   = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    day_name = days[tx.weekday()]
+    date_str = f"{day_name}, {str(tx.day).zfill(2)} {months[tx.month-1]}, {tx.year}. {str(tx.hour).zfill(2)}:{str(tx.minute).zfill(2)} {'pm' if tx.hour >= 12 else 'am'}"
+    session_id = "".join(random.choices("0123456789", k=30))
+    comment_num = "F2MPTb3nfs" + "".join(random.choices("0123456789", k=20))
+    sender_name = "Udtrend LLC"
+    sender_acct = mask_account(rand_digits(10))
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&family=Inter:wght@300..700&display=swap" rel="stylesheet">
+    <title>Sparkle</title>
+    <style>
+        * {{
+            font-size: 14px;
+            background-color: #F9F9F9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }}
+        span {{
+            float: right;
+            color: #737373;
+            font-weight: 700;
+        }}
+        .details p {{
+            color: #797979;
+            font-weight: 400;
+        }}
+        hr {{
+            border: none;
+            height: 1px;
+            background-color: #E9E9E9;
+            margin: 8px 0;
+        }}
+        .container {{
+            margin: 5px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="head-logo">
+            <img src="https://i.ibb.co/4ZYs3tdn/header-logo.jpg" alt="" srcset="" width="100%">
+        </div>
+
+        <div class="details">
+            <p>Session Id <span>{session_id}</span></p>
+            <hr>
+            <p>Type <span>Deposit</span></p>
+            <hr>
+            <p>Date and Time <span>{date_str}</span></p>
+            <hr>
+            <p>Sender <span>{sender_name} - {sender_acct}</span></p>
+            <hr>
+            <p>Recipient <span>{receiver}</span></p>
+            <hr>
+            <p>Amount <span>₦ {fmt_ngn(amount)}</span></p>
+            <hr>
+            <p>Status <span>Successful</span></p>
+            <hr>
+            <p>Comment 
+                <span>{receiver.upper()} Trf for Customer/AT68_TR</span>
+                <span>{comment_num}</span>
+            </p>
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+# ── Access Bank ───────────────────────────────────────────────────────────────
+def tpl_access_bank(receiver: str, amount: int, tx: datetime) -> str:
+    months = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+    date_str = f"{months[tx.month-1]} {tx.day}, {tx.year}"
+    reference = "".join(random.choices("0123456789", k=30))
+    narration = f"Udtrend LLC to {receiver.upper()}:{reference}"
+    theme = random.choice(["orange", "green", "blue"])
+    
+    # Theme colors
+    colors = {
+        "orange": {"header": "#f7941d", "accent": "#f7941d", "icon": "https://i.postimg.cc/XqgVPQkH/ACCESSICON.jpg", "bottom": "https://i.postimg.cc/HxxjbG0p/ACCESSB-UTTOM.jpg"},
+        "green": {"header": "#97b517", "accent": "#97b517", "icon": "https://hebbkx1anhila5yf.public.blob.vercel-storage.com/Green%20Icon-NLJgYEjjReT5r1vNzfe7T6UwF3U2LW.jpg", "bottom": "https://hebbkx1anhila5yf.public.blob.vercel-storage.com/Green%20Bottom-SQlB4sxXWK6OILsYyl5uW1cdF67eEa.jpg"},
+        "blue": {"header": "#3b5998", "accent": "#3b5998", "icon": "https://hebbkx1anhila5yf.public.blob.vercel-storage.com/Blue%20Icon-NALvbaR35w5Uv1f9R0kXiUpFgiqrJ5.jpg", "bottom": "https://i.ibb.co/G3p0bphM/aef36c1e-2af9-45bd-ab6e-a2e593924348.jpg"},
+    }
+    c = colors[theme]
+    
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://fonts.googleapis.com/css2?family=Nunito+Sans:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <title>Access Bank</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Nunito Sans', sans-serif; background: #f5f5f5; }}
+        .divider {{ height: 1px; background-color: #e5e5e5; }}
+        .header-top {{ background-color: {c['header']}; padding: 12px 24px; display: flex; align-items: center; }}
+        .header-top svg {{ width: 24px; height: 24px; stroke: white; }}
+    </style>
+</head>
+<body>
+<div style="max-width: 430px; margin: 0 auto; height: 100vh; overflow: hidden; display: flex; flex-direction: column; background: white;">
+    <!-- MAIN HEADER (with back arrow) -->
+    <div style="background-color: {c['header']}; padding: 40px 24px 28px 24px; flex-shrink: 0; text-align: center; position: relative;">
+        <button style="position: absolute; left: 20px; top: 40px; background: none; border: none; cursor: pointer; padding: 0;">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/>
+            </svg>
+        </button>
+        <p style="color: white; font-size: 16px; font-weight: 600; margin-bottom: 22px;">{date_str}</p>
+        <div style="margin-bottom: 10px;">
+            <img src="{c['icon']}" alt="Transaction Icon" style="width: 80px; height: 80px; border-radius: 16px; object-fit: cover; display: inline-block;">
+        </div>
+        <p style="color: rgba(255,255,255,0.75); font-size: 13px; font-weight: 500; margin-bottom: 6px;">Others</p>
+        <p style="color: white; font-size: 20px; letter-spacing: 0.9px; font-weight: 600;">₦{fmt_ngn(amount)}</p>
+    </div>
+    <div style="height: 5px; background-color: #f2f3ef; flex-shrink: 0;"></div>
+    <!-- TRANSACTION DETAILS -->
+    <div style="background-color: #ffffff; padding: 0 24px; flex-shrink: 0;">
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 18px 0;">
+            <span style="font-size: 14px; color: #444; font-weight: 400;">To</span>
+            <span style="font-size: 14px; color: {c['accent']}; font-weight: 700;">{receiver.upper()}</span>
+        </div>
+        <div class="divider"></div>
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; padding: 18px 0;">
+            <span style="font-size: 14px; color: #444; font-weight: 400; margin-right: 20px;">Narration</span>
+            <span style="font-size: 14px; color: {c['accent']}; font-weight: 700; text-align: right; line-height: 1.55; max-width: 65%; word-wrap: break-word;">{narration}</span>
+        </div>
+        <div class="divider"></div>
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; padding: 18px 0; margin-bottom: 12px;">
+            <span style="font-size: 14px; color: #444; font-weight: 400; margin-right: 20px;">Reference</span>
+            <span style="font-size: 14px; color: {c['accent']}; font-weight: 700; text-align: right; line-height: 1.55; max-width: 65%; word-wrap: break-word;">{reference}</span>
+        </div>
+    </div>
+    <!-- BOTTOM IMAGE -->
+    <div style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; flex-shrink: 0;">
+        <img src="{c['bottom']}" alt="Access Bank Bottom" style="width: 100%; height: 100%; display: block; object-fit: fill;">
+    </div>
+</div>
+</body>
+</html>"""
+
+
+# ════════════════════════════════════════════════════════════════
+# TEMPLATE REGISTRY  (6 templates)
+# ════════════════════════════════════════════════════════════════
+def tpl_binance_any(receiver: str, amount: int, tx) -> str:
+    """Binance counts as one template; the light/dark theme is picked 50/50 here."""
+    theme_fn = random.choice([tpl_binance, tpl_binance_light])
+    logger.info(f"🎨 Binance theme: {'Light' if theme_fn is tpl_binance_light else 'Dark'}")
+    return theme_fn(receiver, amount, tx)
+
+
+# ── Sparkle App (light / dark) ────────────────────────────────────────────────
+SPARKLE_APP_LOGO = "https://hebbkx1anhila5yf.public.blob.vercel-storage.com/ChatGPT%20Image%20May%2024%2C%202026%2C%2006_56_56%20AM-4HBNYsbWFZiYnsdv0KDmkwpWW9Mqju.png"
+
+SPARKLE_APP_CSS = """
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: "Bricolage Grotesque", sans-serif;
+            background: #f5f5f5;
+            min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
+        }
+        .container { max-width: calc(480px); margin: 0 auto; min-height: 100vh; }
+        .receipt-view { display: block; min-height: 100vh; }
+
+        .light-receipt { background: #ffffff; }
+        .light-receipt .receipt-header { display: flex; justify-content: space-between; align-items: center; padding: 15px 30px; }
+        .light-receipt .receipt-title { font-size: 15px; font-weight: 500; color: #1a1a1a; }
+        .light-receipt .sparkle-logo { height: 90px; }
+        .light-receipt .amount-section { text-align: center; padding: 10px 20px 30px; }
+        .light-receipt .amount { font-size: 40px; font-weight: 700; color: #1a1a1a; margin-bottom: 8px; letter-spacing: -1px; }
+        .light-receipt .status { font-size: 14px; color: #81c522; font-weight: 500; }
+        .light-receipt .details-section { padding: 10px 35px 40px; }
+        .light-receipt .detail-row { display: flex; justify-content: space-between; align-items: flex-start; padding: 22px 0; border-bottom: 1px solid #e5e5e5; }
+        .light-receipt .detail-row:last-child { border-bottom: none; }
+        .light-receipt .detail-label { font-size: 14px; color: #9ca3af; font-weight: 400; }
+        .light-receipt .detail-value { font-size: 14px; color: #1a1a1a; font-weight: 500; text-align: right; max-width: 60%; word-break: break-all; }
+        .light-receipt .footer { padding: 10px 30px; }
+        .light-receipt .footer-text { font-size: 13px; color: #1a1a1a; font-weight: 500; }
+
+        .dark-receipt { background: #121212; }
+        .dark-receipt .receipt-header { display: flex; justify-content: space-between; align-items: center; padding: 20px 30px; }
+        .dark-receipt .receipt-title { font-size: 15px; font-weight: 500; color: #ffffff; }
+        .dark-receipt .sparkle-logo { height: 90px; }
+        .dark-receipt .amount-section { text-align: center; padding: 10px 20px 30px; }
+        .dark-receipt .amount { font-size: 40px; font-weight: 700; color: #ffffff; margin-bottom: 8px; letter-spacing: -1px; }
+        .dark-receipt .status { font-size: 14px; color: #81c522; font-weight: 500; }
+        .dark-receipt .details-section { padding: 10px 35px 30px; }
+        .dark-receipt .detail-row { display: flex; justify-content: space-between; align-items: flex-start; padding: 22px 0; border-bottom: 1px solid #2a2a2a; }
+        .dark-receipt .detail-row:last-child { border-bottom: none; }
+        .dark-receipt .detail-label { font-size: 14px; color: #6b7280; font-weight: 400; }
+        .dark-receipt .detail-value { font-size: 14px; color: #ffffff; font-weight: 500; text-align: right; max-width: 60%; word-break: break-all; }
+        .dark-receipt .footer { padding: 30px 24px; }
+        .dark-receipt .footer-text { font-size: 13px; color: #ffffff; font-weight: 500; }
+
+        @media (max-width: 480px) {
+            .container { max-width: 100%; }
+            .light-receipt .amount, .dark-receipt .amount { font-size: 36px; }
+            .light-receipt .receipt-header, .dark-receipt .receipt-header { padding: 15px 20px; }
+            .light-receipt .details-section, .dark-receipt .details-section { padding: 10px 20px 30px; }
+            .light-receipt .footer, .dark-receipt .footer { padding: 20px; }
+            .light-receipt .sparkle-logo, .dark-receipt .sparkle-logo { height: 70px; }
+        }
+        @media (max-width: 360px) {
+            .light-receipt .amount, .dark-receipt .amount { font-size: 32px; }
+            .light-receipt .detail-value, .dark-receipt .detail-value { font-size: 13px; max-width: 55%; }
+            .light-receipt .detail-label, .dark-receipt .detail-label { font-size: 13px; }
+        }
+"""
+
+
+def fmt_sparkle_app_date(tx: datetime) -> str:
+    """Matches the original: 'Mon, May 11 2026 2:35:56 pm'."""
+    hour12 = tx.hour % 12 or 12
+    ampm = "am" if tx.hour < 12 else "pm"
+    return f"{tx.strftime('%a, %b')} {tx.day} {tx.year} {hour12}:{tx.strftime('%M:%S')} {ampm}"
+
+
+def tpl_sparkle_app(receiver: str, amount: int, tx: datetime, theme: str = "light") -> str:
+    theme_class = "dark-receipt" if theme == "dark" else "light-receipt"
+    sender = "Udtrend LLC"
+    account = random.choice(["91", "90", "80", "81", "70"]) + rand_digits(8)
+    session_id = "100004" + tx.strftime("%y%m%d%H%M%S") + rand_digits(11)
+    amount_str = f"&#8358;{amount:,.2f}"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Sparkle Receipt</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,200..800&family=Dongle&family=Itim&family=M+PLUS+1p&family=MuseoModerno:ital,wght@0,100..900;1,100..900&family=Poppins:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,100;1,200;1,300;1,400;1,500;1,600;1,700;1,800;1,900&family=Rubik:ital,wght@0,300..900;1,300..900&display=swap" rel="stylesheet">
+    <style>{SPARKLE_APP_CSS}</style>
+</head>
+<body>
+    <div class="container">
+        <div class="receipt-view {theme_class}">
+            <div class="receipt-header">
+                <span class="receipt-title">Receipt</span>
+                <img src="{SPARKLE_APP_LOGO}" alt="Sparkle" class="sparkle-logo">
+            </div>
+
+            <div class="amount-section">
+                <div class="amount">{amount_str}</div>
+                <div class="status">Success</div>
+            </div>
+
+            <div class="details-section">
+                <div class="detail-row">
+                    <span class="detail-label">Sender</span>
+                    <span class="detail-value">{sender}</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Recipient</span>
+                    <span class="detail-value">{receiver}</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Account number</span>
+                    <span class="detail-value"><span style="filter: blur(4px); display: inline-block; white-space: nowrap; user-select: none;">{account}</span></span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Receiving bank</span>
+                    <span class="detail-value">Sparkle</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Transaction date</span>
+                    <span class="detail-value">{fmt_sparkle_app_date(tx)}</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Session ID</span>
+                    <span class="detail-value"><span style="filter: blur(4px); display: inline-block; user-select: none;">{session_id}</span></span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Comment</span>
+                    <span class="detail-value">Transfer from {sender}</span>
+                </div>
+            </div>
+
+            <div class="footer">
+                <span class="footer-text">Freedom trust tribe</span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+def tpl_sparkle_app_any(receiver: str, amount: int, tx: datetime) -> str:
+    """Sparkle App counts as one template; the light/dark theme is picked 50/50 here."""
+    theme = random.choice(["light", "dark"])
+    logger.info(f"🎨 Sparkle App theme: {theme.title()}")
+    return tpl_sparkle_app(receiver, amount, tx, theme=theme)
+
+
+def tpl_sterling(receiver: str, amount: int, tx: datetime) -> str:
+    date_str = f"{str(tx.day).zfill(2)}/{str(tx.month).zfill(2)}/{tx.year}"
+    reference = rand_ref_hex(42)
+    banknip = rand_digits(16)
+    payref = "".join(random.choices("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=12))
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transaction History</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
+    <style>
+    * {{
+        font-size: 14px;
+    }}
+        body {{
+            font-family: 'Inter', sans-serif;
+        }}
+        .narration-container {{
+            max-height: 120px;
+            overflow-y: auto;
+        }}
+        .narration-container::-webkit-scrollbar {{
+            width: 6px;
+        }}
+        .narration-container::-webkit-scrollbar-track {{
+            background: #f1f1f1;
+            border-radius: 10px;
+        }}
+        .narration-container::-webkit-scrollbar-thumb {{
+            background: #c1c1c1;
+            border-radius: 10px;
+        }}
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div class="mx-auto bg-white min-h-screen shadow-lg">
+        <!-- Header -->
+        <div class="flex items-center justify-center relative p-4 bg-white">
+            <button class="absolute left-4 p-2 rounded-full">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M19 12H5M12 19L5 12L12 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+                </svg>
+            </button>
+            <h1 class="text-lg font-bold text-gray-900">Transaction History</h1>
+        </div>
+
+        <!-- Transaction Details -->
+        <div class="px-6 py-6 space-y-6">
+            <div class="pb-2 border-b border-gray-200">
+                <div class="text-gray-900 font-semibold text-sm mb-1">Transaction Amount</div>
+                <div class="text-gray-800 text-base font-medium">NGN {fmt_ngn(amount)}</div>
+            </div>
+
+            <div class="pb-2 border-b border-gray-200">
+                <div class="text-gray-900 font-semibold text-sm mb-1">Sender Name</div>
+                <div class="text-gray-800 text-base">Udtrend LLC</div>
+            </div>
+
+            <div class="pb-2 border-b border-gray-200">
+                <div class="text-gray-900 font-semibold text-sm mb-1">Transaction Date</div>
+                <div class="text-gray-800 text-base">{date_str}</div>
+            </div>
+
+            <div class="pb-2 border-b border-gray-200">
+                <div class="text-gray-900 font-semibold text-sm mb-1">Reference</div>
+                <div class="text-gray-800 text-base break-all">{reference}</div>
+            </div>
+
+            <div class="pb-2 border-b border-gray-200">
+                <div class="text-gray-900 font-semibold text-sm mb-1">Narration</div>
+                <div class="narration-container">
+                    <div class="text-gray-800 text-base leading-relaxed">BANKNIP From {banknip} 11006 PAYREF: {payref} SENDER: Udtrend LLC REMARK: Transfer to {receiver}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+def tpl_alat(receiver: str, amount: int, tx: datetime) -> str:
+    date_str = tx.strftime("%d %b %Y")
+    words = f"{number_to_words(amount)} Naira Only"
+    remark = f"NIP:UDTREND LLC-TRF TO {receiver.upper()}"[:50]
+    reference = f"000007{tx.strftime('%y%m%d%H%M%S')}{rand_digits(12)}"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transaction Details</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,100;1,200;1,300;1,400;1,500;1,600;1,700;1,800;1,900&display=swap" rel="stylesheet">
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+
+        * {{
+            font-family: 'Poppins', sans-serif;
+        }}
+
+        body {{
+            background-color: white;
+            min-height: 100vh;
+            padding: 0;
+            font-size: 14px;
+        }}
+
+        .container {{
+            width: 100%;
+            max-width: 375px;
+            margin: 0 auto;
+            background: white;
+            cursor: pointer;
+        }}
+
+        .header {{
+            display: flex;
+            align-items: center;
+            padding: 16px;
+            gap: 12px;
+        }}
+
+        .logo {{
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            overflow: hidden;
+        }}
+
+        .logo img {{
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }}
+
+        .header-title {{
+            font-size: 18px;
+            font-weight: 600;
+            color: #8B0000;
+            margin-left: 25px;
+        }}
+
+        .date-section {{
+            background: #f3e8ec;
+            padding: 20px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            font-size: 13px;
+            gap: 12px;
+        }}
+
+        .date-label {{
+            color: #8B0000;
+            flex-shrink: 0;
+            width: 40%;
+        }}
+
+        .date-value {{
+            flex: 1;
+            color: #333;
+            font-weight: 400;
+            outline: none;
+            padding: 2px 4px;
+            border-radius: 4px;
+            transition: all 0.2s;
+            text-align: left;
+        }}
+
+        .details-section {{
+            padding: 16px;
+        }}
+
+        .detail-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 18px;
+            font-size: 13px;
+            gap: 12px;
+        }}
+
+        .detail-label {{
+            color: #8B0000;
+            flex-shrink: 0;
+            width: 40%;
+        }}
+
+        .detail-value {{
+            flex: 1;
+            color: #333;
+            font-weight: 400;
+            min-height: 18px;
+            outline: none;
+            padding: 2px 4px;
+            border-radius: 4px;
+            transition: all 0.2s;
+            word-wrap: break-word;
+            text-align: left;
+        }}
+
+        #referenceNumber {{
+            word-break: break-all;
+            overflow-wrap: break-word;
+            white-space: normal;
+        }}
+
+        .actions {{
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+        }}
+
+        .error-button {{
+            width: 100%;
+            padding: 16px;
+            border: 1.4px solid #8B0000;
+            background: transparent;
+            color: #8B0000;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: 'Inter', sans-serif;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+
+        .done-link {{
+            color: #8B0000;
+            text-decoration: none;
+            font-size: 14px;
+            cursor: pointer;
+            font-family: 'Inter', sans-serif;
+        }}
+
+        @media (max-width: 320px) {{
+            .header-title {{
+                font-size: 16px;
+            }}
+
+            .date-section, .detail-row {{
+                flex-direction: column;
+                gap: 4px;
+            }}
+
+            .date-label, .detail-label {{
+                width: 100%;
+            }}
+
+            .date-value, .detail-value {{
+                width: 100%;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container" id="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="logo">
+                <img src="https://i.ibb.co/tPxPVGSV/channels4-profile-1.jpg" alt="ALAT Logo">
+            </div>
+            <h1 class="header-title">Transaction Details</h1>
+        </div>
+
+        <!-- Transaction Date Section -->
+        <div class="date-section">
+            <span class="date-label">Transaction Date:</span>
+            <div class="date-value" id="transactionDate">{date_str}</div>
+        </div>
+
+        <!-- Transaction Details -->
+        <div class="details-section">
+            <div class="detail-row">
+                <span class="detail-label">Transaction Amount:</span>
+                <div class="detail-value" id="transactionAmount">₦{fmt_ngn(amount)}</div>
+            </div>
+
+            <div class="detail-row">
+                <span class="detail-label">Amount in words:</span>
+                <div class="detail-value" id="amountInWords">{words}</div>
+            </div>
+
+            <div class="detail-row">
+                <span class="detail-label">Transaction Remark:</span>
+                <div class="detail-value" id="transactionRemark">{remark}</div>
+            </div>
+
+            <div class="detail-row">
+                <span class="detail-label">Reference Number:</span>
+                <div class="detail-value" id="referenceNumber">{reference}</div>
+            </div>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="actions">
+            <button class="error-button">Report an Error</button>
+            <a href="#" class="done-link">Done</a>
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+MONIEPOINT_CSS = """
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Inter', sans-serif;
+        }
+
+        body {
+            background: linear-gradient(180deg, #000e28 0%, #000e28 100%);
+            color: white;
+            min-height: 100vh;
+            max-width: 400px;
+            margin: 0 auto;
+            position: relative;
+            padding-bottom: 60px;
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .back-btn {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 30px;
+            cursor: pointer;
+            margin-right: 30px;
+        }
+
+        .header-title {
+            font-size: 14px;
+            font-weight: 500;
+            flex: 1;
+            text-align: center;
+            margin-right: 38px;
+        }
+
+        .main-card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            margin: 0 20px 20px;
+            padding: 14px;
+            border: 2px dotted rgba(79, 78, 78, 0.3);
+            position: relative;
+        }
+
+        .credit-label {
+            display: inline-flex;
+            align-items: center;
+            background: rgba(34, 197, 94, 0.2);
+            color: #22c55e;
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 9px;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-bottom: 16px;
+        }
+
+        .credit-arrow {
+            margin-right: 6px;
+            font-size: 14px;
+        }
+
+        .amount-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .amount {
+            font-size: 22px;
+            font-weight: 700;
+            color: white;
+        }
+
+        .transaction-date {
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 11px;
+            margin-bottom: 0;
+        }
+
+        .transfer-tag {
+            background: rgba(234, 179, 8, 0.2);
+            color: #fad06f;
+            padding: 6px 8px;
+            border-radius: 6px;
+            font-size: 9px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 12px;
+            margin: 0 20px 30px;
+        }
+
+        .action-btn {
+            flex: 1;
+            background: rgba(255, 255, 255, 0.05);
+            border: none;
+            border-radius: 12px;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .action-btn img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 12px;
+        }
+
+        .details-section {
+            margin: 0 20px 40px;
+        }
+
+        .details-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 0;
+            cursor: pointer;
+        }
+
+        .details-title {
+            font-size: 16px;
+            font-weight: 500;
+            color: rgba(255, 255, 255, 0.8);
+        }
+
+        .expand-icon {
+            transition: transform 0.3s;
+            fill: #ffd061;
+        }
+
+        .details-content {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }
+
+        .detail-row {
+            padding: 14px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .detail-row:last-child {
+            border-bottom: none;
+        }
+
+        .detail-label {
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 13px;
+            margin-bottom: 6px;
+        }
+
+        .detail-value {
+            color: white;
+            font-size: 14px;
+            font-weight: 500;
+            word-break: break-all;
+        }
+
+        .transfer-type-tag {
+            display: inline-block;
+            background: rgba(234, 179, 8, 0.2);
+            color: #ffd061;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .home-indicator {
+            position: fixed;
+            bottom: 8px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 134px;
+            height: 5px;
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 3px;
+        }
+
+        @media (max-height: 700px) {
+            .details-section {
+                margin-bottom: 30px;
+            }
+
+            .details-content {
+                margin-bottom: 15px;
+            }
+
+            body {
+                padding-bottom: 50px;
+            }
+        }
+
+        @media (max-height: 600px) {
+            .details-section {
+                margin-bottom: 25px;
+            }
+
+            .details-content {
+                margin-bottom: 10px;
+            }
+
+            body {
+                padding-bottom: 45px;
+            }
+        }
+"""
+
+
+def fmt_moniepoint_date(tx: datetime) -> str:
+    day = tx.day
+    suffix = "th" if 3 < day < 21 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{tx.strftime('%A')}, {tx.strftime('%B')} {day}{suffix}, {tx.year}"
+
+
+def tpl_moniepoint(receiver: str, amount: int, tx: datetime) -> str:
+    date_str = fmt_moniepoint_date(tx)
+    hour12 = tx.hour % 12 or 12
+    time_str = f"{hour12}:{tx.minute:02d} {'AM' if tx.hour < 12 else 'PM'}"
+    reference = f"MIT|CRP|{rand_digits(30)}|{rand_digits(20)}_CREDIT_{random.randint(0, 9)}"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moniepoint Transaction Receipt</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>{MONIEPOINT_CSS}</style>
+</head>
+<body>
+    <div class="receipt-container">
+        <!-- Header -->
+        <div class="header">
+            <button class="back-btn">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                    <path d="M15 18L9 12L15 6" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+                </svg>
+            </button>
+            <div class="header-title">Transaction Details</div>
+        </div>
+
+        <!-- Main Card -->
+        <div class="main-card">
+            <div class="credit-label">
+                <span class="credit-arrow">↓</span>
+                CREDIT
+            </div>
+            <div class="amount-row">
+                <div class="amount">₦{fmt_ngn(amount)}</div>
+                <div class="transfer-tag">TRANSFER</div>
+            </div>
+            <div class="transaction-date">{date_str} | {time_str}</div>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="action-buttons">
+            <button class="action-btn" style="padding-left: 8px;">
+                <img src="https://i.postimg.cc/VkWWzBCX/dowload.jpg" alt="Share" crossorigin="anonymous">
+            </button>
+            <button class="action-btn">
+                <img src="https://i.postimg.cc/dVPykkYn/share.jpg" alt="Download" crossorigin="anonymous">
+            </button>
+        </div>
+
+        <!-- Details Section -->
+        <div class="details-section">
+            <div class="details-header">
+                <div class="details-title">Other Details</div>
+                <svg class="expand-icon" width="16" height="16" viewBox="0 0 16 16" style="transform: rotate(180deg);">
+                    <path fill-rule="evenodd" d="M1.646 4.646a.5.5 0 01.708 0L8 10.293l5.646-5.647a.5.5 0 01.708.708l-6 6a.5.5 0 01-.708 0l-6-6a.5.5 0 010-.708z"></path>
+                </svg>
+            </div>
+
+            <div class="details-content">
+                <div class="detail-row">
+                    <div class="detail-label">Transaction Type</div>
+                    <div class="detail-value">
+                        <span class="transfer-type-tag">Transfer</span>
+                    </div>
+                </div>
+
+                <div class="detail-row">
+                    <div class="detail-label">Transaction Date</div>
+                    <div class="detail-value">{date_str}</div>
+                </div>
+
+                <div class="detail-row">
+                    <div class="detail-label">Source</div>
+                    <div class="detail-value">Udtrend LLC</div>
+                </div>
+
+                <div class="detail-row">
+                    <div class="detail-label">Source Institution</div>
+                    <div class="detail-value">Moniepoint MFB</div>
+                </div>
+
+                <div class="detail-row">
+                    <div class="detail-label">Transaction Reference</div>
+                    <div class="detail-value">{reference}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Home Indicator -->
+    <div class="home-indicator"></div>
+</body>
+</html>"""
+
+
+OPAY_CSS = """
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background-color: var(--bg-primary);
+      color: var(--text-primary);
+    }
+
+    [data-theme="light"] {
+      --bg-primary: #f5f5f5;
+      --bg-secondary: #ffffff;
+      --bg-card: #ffffff;
+      --text-primary: #333333;
+      --text-secondary: #888888;
+      --border-color: #f0f0f0;
+      --accent: #00b389;
+      --accent-hover: #009975;
+    }
+
+    [data-theme="dark"] {
+      --bg-primary: #1a1a1a;
+      --bg-secondary: #2b2b2b;
+      --bg-card: #2b2b2b;
+      --text-primary: #ffffff;
+      --text-secondary: #a0a0a0;
+      --border-color: #3a3a3a;
+      --accent: #00b389;
+      --accent-hover: #009975;
+    }
+
+    .opay-container {
+      min-height: 100vh;
+      max-width: 600px;
+      margin: 0 auto;
+      background-color: var(--bg-primary);
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background-color: var(--bg-secondary);
+      padding: 10px;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .back-button {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 16px;
+      font-weight: 500;
+      cursor: pointer;
+      color: var(--text-primary);
+    }
+
+    .support-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      overflow: hidden;
+      cursor: pointer;
+    }
+
+    .support-icon img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .content {
+      padding: 10px;
+      padding-bottom: 80px;
+    }
+
+    .receipt-card {
+      background-color: var(--bg-card);
+      border-radius: 12px;
+      padding: 18px;
+      margin: 10px;
+    }
+
+    .main-card {
+      padding-top: 40px;
+      margin-top: 25px;
+      position: relative;
+    }
+
+    .bank-logo {
+      width: 50px;
+      height: 50px;
+      position: absolute;
+      top: -20px;
+      left: 50%;
+      transform: translateX(-50%);
+      border-radius: 50%;
+      overflow: hidden;
+      cursor: pointer;
+      background: white;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .bank-logo img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .transaction-main {
+      text-align: center;
+    }
+
+    .transfer-from {
+      font-size: 14px;
+      margin-bottom: 12px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .amount {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 12px;
+      color: var(--text-primary);
+    }
+
+    .status {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    .details-title {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: var(--text-primary);
+    }
+
+    .detail-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      font-size: 14px;
+      gap: 16px;
+    }
+
+    .detail-label {
+      color: var(--text-secondary);
+      flex-shrink: 0;
+    }
+
+    .detail-value {
+      text-align: right;
+      font-weight: 500;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .share-button {
+      position: fixed;
+      bottom: 15px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: calc(99% - 60px);
+      max-width: 560px;
+      background-color: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 50px;
+      padding: 20px;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      z-index: 100;
+    }
+
+    .copy-icon {
+      cursor: pointer;
+      color: var(--text-secondary);
+      width: 16px;
+      height: 16px;
+    }
+
+    .arrow-left {
+      width: 20px;
+      height: 20px;
+    }
+
+    .chevron-right {
+      width: 16px;
+      height: 16px;
+      color: var(--text-secondary);
+    }
+
+    .more-actions-card {
+      background-color: var(--bg-card);
+      border-radius: 12px;
+      margin: 10px;
+      margin-bottom: 16px;
+      overflow: hidden;
+      padding: 0;
+    }
+
+    .more-actions-image {
+      position: relative;
+      right: 5%;
+      width: 110%;
+      height: auto;
+      display: block;
+    }
+"""
+
+OPAY_SENDER_BANKS = [
+    ("Wema Bank PLC",  "https://s3-symbol-logo.tradingview.com/wema-bank-plc--600.png"),
+    ("PAYSTACK-TITAN", "https://i.ibb.co/fLkMFXr/paystack-logo-modified.png"),
+]
+
+OPAY_THEME_ASSETS = {
+    "light": ("https://hebbkx1anhila5yf.public.blob.vercel-storage.com/supporticon.jpg-BCuk3oRE5B07QPx3cONHOcHLyif9Oz.jpeg",
+              "https://i.postimg.cc/BZTf0VKX/new-light.jpg"),
+    "dark":  ("https://i.postimg.cc/Z5YP2Xhy/darl-re-icon.jpg",
+              "https://i.postimg.cc/PfFfDRt2/more-action-2.jpg"),
+}
+
+
+def fmt_opay_date(tx: datetime) -> str:
+    day = tx.day
+    suffix = "th" if 3 < day < 21 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{tx.strftime('%b')} {day}{suffix}, {tx.year} {tx.strftime('%H:%M:%S')}"
+
+
+def tpl_opay(receiver: str, amount: int, tx: datetime, theme: str = "light") -> str:
+    sender_name = "UDTREND LLC"
+    bank_name, bank_logo = random.choice(OPAY_SENDER_BANKS)
+    support_icon, more_actions = OPAY_THEME_ASSETS[theme]
+    transaction_no = "25100206010050" + rand_digits(12)
+    session_id = "000017250419001303" + rand_digits(12)
+    return f"""<!DOCTYPE html>
+<html lang="en" data-theme="{theme}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OPay Receipt</title>
+  <style>{OPAY_CSS}</style>
+</head>
+<body>
+  <div class="opay-container">
+    <div class="header">
+      <div class="back-button">
+        <svg class="arrow-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 12H5M12 19l-7-7 7-7"></path>
+        </svg>
+        Transaction Details
+      </div>
+      <div class="support-icon">
+        <img src="{support_icon}" alt="Support">
+      </div>
+    </div>
+
+    <div class="content">
+      <div>
+        <div class="receipt-card main-card">
+          <div class="bank-logo">
+            <img src="{bank_logo}" alt="Bank Logo">
+          </div>
+
+          <div class="transaction-main">
+            <div class="transfer-from">Transfer from {sender_name}</div>
+            <div class="amount">₦{fmt_ngn(amount)}</div>
+            <div class="status">
+              <svg width="17" height="17" viewBox="0 0 20 20" fill="none">
+                <path d="M10 0C4.48 0 0 4.48 0 10C0 15.52 4.48 20 10 20C15.52 20 20 15.52 20 10C20 4.48 15.52 0 10 0ZM8 15L3 10L4.41 8.59L8 12.17L15.59 4.58L17 6L8 15Z" fill="currentColor"></path>
+              </svg>
+              Successful
+            </div>
+          </div>
+        </div>
+
+        <div class="receipt-card">
+          <div class="details-title">Transaction Details</div>
+
+          <div class="detail-row">
+            <div class="detail-label">Credited to</div>
+            <div class="detail-value">
+              Available Balance
+              <svg class="chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 18l6-6-6-6"></path>
+              </svg>
+            </div>
+          </div>
+
+          <div class="detail-row">
+            <div class="detail-label">Sender Details</div>
+            <div class="detail-value">
+              {sender_name}<br>{bank_name} | 042****101
+            </div>
+          </div>
+
+          <div class="detail-row">
+            <div class="detail-label">Remark</div>
+            <div class="detail-value">Transfer to {receiver}</div>
+          </div>
+
+          <div class="detail-row">
+            <div class="detail-label">Transaction Type</div>
+            <div class="detail-value">Bank Deposit</div>
+          </div>
+
+          <div class="detail-row">
+            <div class="detail-label">Transaction No.</div>
+            <div class="detail-value">
+              <span style="filter: blur(4px); display: inline-block; user-select: none;">{transaction_no}</span>
+              <svg class="copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+              </svg>
+            </div>
+          </div>
+
+          <div class="detail-row">
+            <div class="detail-label">Transaction Date</div>
+            <div class="detail-value">{fmt_opay_date(tx)}</div>
+          </div>
+
+          <div class="detail-row">
+            <div class="detail-label">Session ID</div>
+            <div class="detail-value">
+              <span style="filter: blur(4px); display: inline-block; user-select: none;">{session_id}</span>
+              <svg class="copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="more-actions-card">
+          <img src="{more_actions}" alt="More Actions" class="more-actions-image">
+        </div>
+
+        <button class="share-button">Share Receipt</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def tpl_opay_any(receiver: str, amount: int, tx: datetime) -> str:
+    """OPay counts as one template; the light/dark theme is picked 50/50 here."""
+    theme = random.choice(["light", "dark"])
+    logger.info(f"🎨 OPay theme: {theme.title()}")
+    return tpl_opay(receiver, amount, tx, theme=theme)
+
+
+ZENITH_CSS = """
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+        }
+
+        body {
+            background: #f5f5f5;
+            color: #333;
+            min-height: 100vh;
+            max-width: 400px;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        .receipt-container {
+            display: block;
+            background: #F5F5F5;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            z-index: 1000;
+            overflow-y: auto;
+            padding: 20px;
+        }
+
+        .back-button {
+            background: none;
+            border: none;
+            font-size: 23px;
+            cursor: pointer;
+            padding: 10px;
+            margin-bottom: 20px;
+            color: #333;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 40px;
+            height: 40px;
+        }
+
+        .success-section {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .success-icon {
+            width: 65px;
+            height: 65px;
+            background: #61d08f;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+        }
+
+        .success-icon i {
+            font-size: 40px;
+            font-weight: 900;
+            color: white;
+        }
+
+        .success-title {
+            font-size: 24px;
+            font-weight: 700;
+            color: #000;
+            letter-spacing: -0.5px;
+        }
+
+        .receipt-card {
+            background: white;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        .watermark {
+            position: absolute;
+            top: 73%;
+            left: 60%;
+            transform: translate(-50%, -50%);
+            opacity: 0.07;
+            width: 350px;
+            height: 350px;
+            pointer-events: none;
+        }
+
+        .receipt-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .receipt-header-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #000;
+            letter-spacing: -0.3px;
+        }
+
+        .zenith-logo {
+            width: 60px;
+            height: 60px;
+            object-fit: contain;
+        }
+
+        .receipt-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 20px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .receipt-label {
+            color: #666;
+            font-size: 17px;
+            font-weight: 600;
+            flex-shrink: 0;
+            letter-spacing: -0.1px;
+        }
+
+        .receipt-value {
+            color: #000;
+            font-size: 18px;
+            font-weight: 900;
+            text-align: right;
+            word-break: break-word;
+            margin-left: 16px;
+            letter-spacing: -0.2px;
+        }
+
+        .receipt-value.amount {
+            font-size: 20px;
+            font-weight: 550;
+        }
+
+        .receipt-value.account-info {
+            font-size: 13px;
+        }
+
+        .receipt-value.small {
+            font-size: 17px;
+        }
+
+        .dotted-line {
+            border-bottom: 1px dashed #E0E0E0;
+            margin: 20px 0;
+            position: relative;
+            z-index: 1;
+        }
+
+        .transaction-id-section {
+            margin-top: 24px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .receipt-buttons {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+        }
+
+        .share-btn {
+            flex: 1;
+            background: white;
+            border: 2px solid #E0E0E0;
+            border-radius: 12px;
+            padding: 14px;
+            color: #333;
+            font-size: 18px;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            letter-spacing: -0.2px;
+        }
+
+        .download-btn {
+            width: 56px;
+            height: 56px;
+            background: white;
+            border: 2px solid #E0E0E0;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+        }
+
+        .download-btn svg {
+            width: 24px;
+            height: 24px;
+        }
+"""
+
+ZENITH_SENDER_BANKS = ["Opay", "Moniepoint MFB", "PalmPay", "Kuda MFB"]
+
+
+def tpl_zenith(receiver: str, amount: int, tx: datetime) -> str:
+    sender_name = "UDTREND LLC"
+    sender_bank = random.choice(ZENITH_SENDER_BANKS)
+    sender_acct = f"{random.choice(['7', '8', '9'])}{rand_digits(3)}****{rand_digits(2)}"
+    to_account = "0" + rand_digits(9)
+    txn_id = f"2221{rand_digits(17)}<br>{rand_digits(12)}"
+    date_str = f"{tx.strftime('%d-%m-%Y')}<br>{tx.strftime('%H:%M:%S')}"
+    logo = "https://i.postimg.cc/g2c3CGsd/zenith-logo.webp"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zenith Bank Receipt</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=SF+Pro+Display:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>{ZENITH_CSS}</style>
+</head>
+<body>
+    <div class="receipt-container">
+        <button class="back-button">
+            <i class="fa-solid fa-arrow-left"></i>
+        </button>
+
+        <div class="success-section">
+            <div class="success-icon">
+                <i class="fa-solid fa-check"></i>
+            </div>
+            <div class="success-title">Payment Successful</div>
+        </div>
+
+        <div class="receipt-card">
+            <img src="{logo}" alt="Zenith Logo" class="watermark">
+
+            <div class="receipt-header">
+                <div class="receipt-header-title">Transaction Receipt</div>
+                <img src="{logo}" alt="Zenith Logo" class="zenith-logo">
+            </div>
+
+            <div class="receipt-row">
+                <div class="receipt-label">Amount</div>
+                <div class="receipt-value amount">₦ {fmt_ngn(amount)}</div>
+            </div>
+
+            <div class="receipt-row">
+                <div class="receipt-label">From</div>
+                <div class="receipt-value">
+                    <div>{sender_name}</div>
+                    <div class="account-info">{sender_acct} ({sender_bank})</div>
+                </div>
+            </div>
+
+            <div class="receipt-row">
+                <div class="receipt-label">To</div>
+                <div class="receipt-value"><span style="filter: blur(4px); display: inline-block; white-space: nowrap; user-select: none;">{to_account}</span></div>
+            </div>
+
+            <div class="receipt-row">
+                <div class="receipt-label">Transaction Type</div>
+                <div class="receipt-value">NIP/Direct Credit</div>
+            </div>
+
+            <div class="receipt-row">
+                <div class="receipt-label">Date</div>
+                <div class="receipt-value">{date_str}</div>
+            </div>
+
+            <div class="receipt-row">
+                <div class="receipt-label">Description</div>
+                <div class="receipt-value">Transfer from {sender_name} to {receiver}</div>
+            </div>
+
+            <div class="dotted-line"></div>
+
+            <div class="transaction-id-section">
+                <div class="receipt-row">
+                    <div class="receipt-label">Transaction ID</div>
+                    <div class="receipt-value small"><span style="filter: blur(4px); display: inline-block; user-select: none;">{txn_id}</span></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="receipt-buttons">
+            <button class="share-btn">
+                Share Receipt
+                <i class="fa-solid fa-share-nodes"></i>
+            </button>
+            <button class="download-btn">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+            </button>
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+TEMPLATES = [
+    ("UBA Classic",       tpl_uba1),
+    ("UBA Modern",        tpl_uba2),
+    ("Roqqu",             tpl_roqqu),
+    ("Roqqu App",         tpl_roqqu_app_any),
+    ("Kuda",              tpl_kuda),
+    ("Sparkle",           tpl_sparkle),
+    ("Sparkle App",       tpl_sparkle_app_any),
+    ("Access Bank",       tpl_access_bank),
+    ("Binance",           tpl_binance_any),
+    ("FairMoney",         tpl_fairmoney),
+    ("Sterling Bank",     tpl_sterling),
+    ("ALAT",              tpl_alat),
+    ("Moniepoint",        tpl_moniepoint),
+    ("OPay",              tpl_opay_any),
+    ("Zenith Bank",       tpl_zenith),
+]
+
+# Crypto templates: no Udtrend LLC bank-withdrawal page, USDT caption without a name.
+CRYPTO_TEMPLATES = {"Roqqu", "Roqqu App", "Binance"}
+
+
+# ══════════════════════════════════════════���══════���══════════════
+# PLAYWRIGHT RENDERER
+# ════════════════════════════════════════════════════════════════
+def get_chromium_path():
+    for p in ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+async def html_to_image(html: str) -> BytesIO:
+    """
+    Render HTML → PNG.
+    Viewport: 390 px (iPhone 14 logical), device_scale_factor=3 → 1170 px wide output.
+    Waits for networkidle + 3 s extra + JS img promise for CDN images.
+    """
+    kwargs = {
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ]
+    }
+    cp = get_chromium_path()
+    if cp:
+        kwargs["executable_path"] = cp
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(**kwargs)
+        context = await browser.new_context(
+            viewport={"width": 390, "height": 844},
+            device_scale_factor=3,
+        )
+        page = await context.new_page()
+
+        # Load page; allow 30 s for CDN resources
+        await page.set_content(
+    html,
+    wait_until="domcontentloaded",
+    timeout=60_000
+)
+
+        # Extra pause for slower CDN hosts (ibb.co, vercel blob, postimg…)
+        await asyncio.sleep(3)
+
+        # Wait for every <img> to finish loading
+        await page.evaluate("""() => {
+            return Promise.all(
+                Array.from(document.images)
+                    .filter(img => !img.complete)
+                    .map(img => new Promise(resolve => {
+                        img.onload = resolve;
+                        img.onerror = resolve;
+                    }))
+            );
+        }""")
+
+        # Expand viewport to full page height then screenshot
+        height = await page.evaluate("document.documentElement.scrollHeight")
+        await page.set_viewport_size({"width": 390, "height": max(height, 100)})
+        data = await page.screenshot(full_page=True)
+        await browser.close()
+
+    buf = BytesIO(data)
+    buf.name = "receipt.png"
+    return buf
+
+
+# ═══════════════����════════════════════════════════════════════════
+# CHANNEL AUTO-DISCOVERY
+# ════════════════════════════════════════════════════════════════
+def register_channel(chat_id: int, title: str = ""):
+    if chat_id not in known_channels:
+        known_channels.add(chat_id)
+        logger.info(f"✅ Registered channel: {chat_id}" + (f" ({title})" if title else ""))
+
+
+async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.channel_post:
+        register_channel(update.channel_post.chat.id, update.channel_post.chat.title or "")
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.my_chat_member:
+        return
+    chat   = update.my_chat_member.chat
+    member = update.my_chat_member.new_chat_member
+    if chat.type == "channel":
+        if member.status in ("administrator", "creator"):
+            register_channel(chat.id, chat.title or "")
+        elif member.status in ("left", "kicked", "restricted", "member"):
+            known_channels.discard(chat.id)
+            logger.info(f"🗑  Removed channel (lost admin): {chat.id}")
+
+
+async def scan_history(bot: Bot):
+    try:
+        updates = await bot.get_updates(limit=100, timeout=0)
+        for u in updates:
+            if u.channel_post:
+                register_channel(u.channel_post.chat.id, u.channel_post.chat.title or "")
+            if u.my_chat_member:
+                chat   = u.my_chat_member.chat
+                member = u.my_chat_member.new_chat_member
+                if chat.type == "channel" and member.status in ("administrator", "creator"):
+                    register_channel(chat.id, chat.title or "")
+        logger.info(f"📋 History scan done — {len(known_channels)} channel(s) found")
+    except Exception as e:
+        logger.warning(f"History scan failed: {e}")
+
+
+# ══════════════════��══════════════════════════════════════════  ══
+# POSTER
+# ══════════════════════════════════════════���═════════════════════
+def find_template(name: str):
+    """Look up a template by name, ignoring case and spaces (e.g. 'opay', 'roqqu app')."""
+    key = name.replace(" ", "").lower()
+    for tpl in TEMPLATES:
+        if tpl[0].replace(" ", "").lower() == key:
+            return tpl
+    return None
+
+
+async def post_to_all_channels(bot: Bot, forced_template=None):
+    if not known_channels:
+        logger.warning("⚠️  No channels found. Make the bot admin in a channel and send a message there.")
+        return
+
+    now      = datetime.now()
+    tx_time  = transaction_time(now)
+    amount   = random_amount()
+    receiver = random_name()
+
+    tpl_name, tpl_fn = forced_template or random.choice(TEMPLATES)
+    logger.info(f"🎲 Template: {tpl_name} | ₦{amount:,} → {receiver}")
+
+    # Shared recipient account for receipts that show it, so the Udtrend LLC
+    # withdrawal page matches the receipt (randomized each posting)
+    kuda_acct = rand_digits(10) if tpl_name in ("Kuda", "FairMoney") else ""
+
+    # Render the receipt image
+    if tpl_name in ("Kuda", "FairMoney"):
+        html  = tpl_fn(receiver, amount, tx_time, kuda_acct)
+    else:
+        html  = tpl_fn(receiver, amount, tx_time)
+    image = await html_to_image(html)
+
+    # Build the paired Udtrend LLC withdrawal page (skip for Roqqu / crypto)
+    udtrend_image = None
+    if tpl_name not in CRYPTO_TEMPLATES:
+        bank_name, account_number, account_name = udtrend_details_for(tpl_name, receiver, kuda_acct)
+        udtrend_html  = tpl_udtrend(amount, tx_time, bank_name, account_number, account_name)
+        udtrend_image = await html_to_image(udtrend_html)
+
+    if tpl_name in CRYPTO_TEMPLATES:
+        usdt = round(amount / 1600, 2)
+        caption = build_caption(f"Udtrend LLC has successfully credited a user with {usdt} USDT just now.")
+    else:
+        caption = build_caption(f"Udtrend LLC has successfully credited {receiver} with {fmt_caption(amount)}.00 just now.")
+
+    for cid in list(known_channels):
+        try:
+            # Delete previous message(s) if any exist
+            if cid in last_message_ids:
+                for mid in last_message_ids[cid]:
+                    try:
+                        await bot.delete_message(chat_id=cid, message_id=mid)
+                        logger.info(f"🗑  Deleted previous message {mid} from {cid}")
+                    except TelegramError as e:
+                        logger.warning(f"⚠️  Could not delete message {mid} from {cid}: {e}")
+
+            if udtrend_image is not None:
+                # Post the Udtrend LLC withdrawal page + receipt together as one album
+                udtrend_image.seek(0)
+                image.seek(0)
+                media = [
+                    InputMediaPhoto(media=udtrend_image, caption=caption, parse_mode="HTML"),
+                    InputMediaPhoto(media=image),
+                ]
+                messages = await bot.send_media_group(chat_id=cid, media=media)
+                last_message_ids[cid] = [m.message_id for m in messages]
+                logger.info(f"📤 Sent album {last_message_ids[cid]} to {cid}")
+            else:
+                # Roqqu: receipt only, no paired page
+                image.seek(0)
+                message = await bot.send_photo(chat_id=cid, photo=image, caption=caption, parse_mode="HTML")
+                last_message_ids[cid] = [message.message_id]
+                logger.info(f"📤 Sent message {message.message_id} to {cid}")
+        except TelegramError as e:
+            logger.error(f"❌ Failed to send to {cid}: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# SCHEDULER
+# ═══════════════════════  ════  ═══════════════════════════════════
+async def scheduler(bot: Bot):
+    logger.info(f"    Posting every {POST_INTERVAL_MINUTES} minute(s)")
+    while True:
+        await post_to_all_channels(bot)
+        await asyncio.sleep(POST_INTERVAL_MINUTES * 60)
+
+
+# ══════════���═════════════════════════════════════════════════════
+# MAIN
+# ════════════════  ═══════════════════════════════════════════════
+async def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    bot = app.bot
+    me  = await bot.get_me()
+    logger.info(f"🤖 Started as @{me.username} | {len(TEMPLATES)} templates loaded")
+
+    await scan_history(bot)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
+        allowed_updates=["channel_post", "my_chat_member"],
+        drop_pending_updates=False,
+    )
+    await scheduler(bot)
+
+
+async def post_once(template_name: str):
+    """Post a single receipt using the named template, then exit."""
+    tpl = find_template(template_name)
+    if tpl is None:
+        names = ", ".join(t[0] for t in TEMPLATES)
+        print(f"Unknown template '{template_name}'. Available: {names}")
+        return
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    await app.initialize()
+    try:
+        await scan_history(app.bot)
+        await post_to_all_channels(app.bot, forced_template=tpl)
+    finally:
+        await app.shutdown()
+
+
+if __name__ == "__main__":
+    import sys
+    args = sys.argv[1:]
+    if args and args[0] == "--list":
+        for t in TEMPLATES:
+            print(t[0])
+    elif args and args[0] == "--once":
+        if len(args) < 2:
+            print('Usage: python udtrend_bot.py --once "Template Name"')
+        else:
+            asyncio.run(post_once(" ".join(args[1:])))
+    else:
+        asyncio.run(main())
